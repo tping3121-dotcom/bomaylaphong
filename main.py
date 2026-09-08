@@ -41,8 +41,6 @@ NSFW_THRESHOLD = float(os.getenv("NSFW_THRESHOLD", "0.75"))
 
 WARN_USER = os.getenv("WARN_USER", "true").lower() == "true"
 
-WARNING_SECONDS = int(os.getenv("WARNING_SECONDS", "5"))
-
 # Tự động mute bao nhiêu phút khi phát hiện NSFW
 AUTO_MUTE_MINUTES = int(os.getenv("AUTO_MUTE_MINUTES", "2"))
 
@@ -573,6 +571,7 @@ async def auto_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_warning(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gửi tin nhắn cảnh báo và GIỮ NGUYÊN (không tự động xóa)"""
     if not WARN_USER or not update.effective_chat:
         return
 
@@ -580,19 +579,13 @@ async def send_warning(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         name = user.first_name if user else "Người dùng"
 
-        warning = await context.bot.send_message(
+        await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=(
                 f"⚠️ {name}, nội dung của bạn đã bị xoá vì chứa nội dung nhạy cảm/18+.\n\n"
                 f"🔇 Bạn bị cấm chat {AUTO_MUTE_MINUTES} phút."
             )
         )
-
-        await asyncio.sleep(WARNING_SECONDS)
-        try:
-            await warning.delete()
-        except Exception:
-            pass
     except Exception as e:
         logger.warning("Warning error: %s", e)
 
