@@ -1,1 +1,8 @@
-
+python-telegram-bot>=22.0,<23.0
+transformers>=4.45,<5.0
+torch>=2.2
+torchvision>=0.17
+Pillow>=10.0
+opencv-python-headless>=4.9
+numpy>=1.26
+safetensors>=0.4
