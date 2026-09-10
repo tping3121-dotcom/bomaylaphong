@@ -32,7 +32,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "THAY_BOT_TOKEN_CUA_BAN")
 
 # Telegram ID của chủ bot
-OWNER_ID = int(os.getenv("OWNER_ID", "123456789"))
+OWNER_ID = int(os.getenv("OWNER_ID", "7449833411"))
 
 # Model NSFW
 NSFW_MODEL = "Falconsai/nsfw_image_detection"
