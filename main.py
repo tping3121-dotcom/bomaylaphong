@@ -43,10 +43,7 @@ MUTE_MINUTES = 2
 MAX_AI_CONCURRENT = 2
 DB_PATH = os.getenv("DB_PATH", "nsfw_bot.db")
 
-# ⏱️ Chống spam cảnh báo chưa cấp quyền (giây)
-UNAUTHORIZED_WARN_COOLDOWN = 300  # 5 phút
-
-# 🧠 Cache admin 60 giây
+UNAUTHORIZED_WARN_COOLDOWN = 300
 ADMIN_CACHE_TTL = 60
 
 
@@ -128,7 +125,6 @@ def init_db():
             ON known_users(chat_id, username)
             """
         )
-        # Chống spam cảnh báo
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS warn_cooldown (
@@ -248,6 +244,75 @@ def get_group_info_sync(chat_id):
         return dict(row) if row else None
     finally:
         conn.close()
+
+
+# =========================================================
+# 🆕 GROUP LOOKUP BY USERNAME
+# =========================================================
+
+def find_group_by_username_sync(username):
+    """Tìm nhóm trong DB theo username (không cần @)."""
+    conn = get_db()
+    try:
+        username = username.lstrip("@").lower()
+        row = conn.execute(
+            """
+            SELECT chat_id, title, username, enabled
+            FROM groups
+            WHERE LOWER(username) = ?
+            LIMIT 1
+            """,
+            (username,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+async def find_group_by_username(username):
+    return await asyncio.to_thread(find_group_by_username_sync, username)
+
+
+def find_group_by_chat_id_sync(chat_id):
+    conn = get_db()
+    try:
+        row = conn.execute(
+            """
+            SELECT chat_id, title, username, enabled
+            FROM groups
+            WHERE chat_id = ?
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+async def find_group_by_chat_id(chat_id):
+    return await asyncio.to_thread(find_group_by_chat_id_sync, chat_id)
+
+
+def list_all_groups_sync(limit=50):
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT chat_id, title, username, enabled
+            FROM groups
+            ORDER BY requested_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def list_all_groups(limit=50):
+    return await asyncio.to_thread(list_all_groups_sync, limit)
 
 
 # =========================================================
@@ -549,7 +614,7 @@ class NsfwDetector:
 
 
 detector = NsfwDetector()
-ai_semaphore: asyncio.Semaphore | None = None
+ai_semaphore = None
 
 
 def get_ai_semaphore():
@@ -570,7 +635,7 @@ async def detect_nsfw(image_path, is_sticker=False):
 # 👮 KIỂM TRA ADMIN (có cache)
 # =========================================================
 
-_admin_cache: dict[tuple[int, int], tuple[float, bool]] = {}
+_admin_cache = {}
 
 
 async def is_admin(bot, chat_id, user_id, use_cache=True):
@@ -720,7 +785,6 @@ def mute_permissions():
 
 
 def normal_permissions():
-    # Không dùng ChatPermissions.all_permissions() vì có thể không tồn tại
     return ChatPermissions(
         can_send_messages=True,
         can_send_audios=True,
@@ -780,17 +844,14 @@ async def resolve_user(update, context):
     if not message or not chat:
         return None
 
-    # 1️⃣ Reply
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user
 
-    # 2️⃣ Args
     if not context.args:
         return None
 
     text = context.args[0].strip()
 
-    # ID
     if re.fullmatch(r"-?\d+", text):
         try:
             user_id = int(text)
@@ -799,7 +860,6 @@ async def resolve_user(update, context):
         except Exception:
             return None
 
-    # Username
     if text.startswith("@"):
         user_id = await find_user_by_username(chat.id, text)
         if not user_id:
@@ -832,52 +892,10 @@ async def start(update, context):
 
 
 # =========================================================
-# 🆕 WELCOME - KHI BOT ĐƯỢC THÊM VÀO NHÓM
-# =========================================================
-
-async def on_bot_added(update, context):
-    """Khi bot được thêm vào nhóm mới."""
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not message or not chat:
-        return
-
-    # Kiểm tra bot có phải vừa được thêm không
-    if not message.new_chat_members:
-        return
-
-    me = await context.bot.get_me()
-    added = any(m.id == me.id for m in message.new_chat_members)
-
-    if not added:
-        return
-
-    logger.info("🆕 Bot được thêm vào nhóm: %s (%s)", chat.title, chat.id)
-
-    # Nếu đã được cấp quyền → chào mừng
-    if await group_enabled(chat.id):
-        try:
-            await message.reply_text(
-                "🎉 <b>CẢM ƠN ĐÃ THÊM BOT!</b>\n\n"
-                "🛡️ Nhóm đã được cấp quyền từ trước.\n"
-                "Bot sẽ tự động kiểm duyệt nội dung 18+.",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-        return
-
-    # Chưa được cấp quyền → thông báo + gửi yêu cầu admin
-    await notify_unauthorized(chat, context, requester=None)
-
-
-# =========================================================
-# 🆕 THÔNG BÁO CHƯA CẤP QUYỀN + GỬI YÊU CẦU ADMIN
+# 🆕 BUILD GROUP INFO TEXT
 # =========================================================
 
 def build_group_info_text(chat, requester=None):
-    """Tạo text đầy đủ thông tin nhóm."""
     lines = [
         "🔔 <b>YÊU CẦU CẤP QUYỀN BOT</b>",
         "",
@@ -895,9 +913,7 @@ def build_group_info_text(chat, requester=None):
 
     if requester:
         lines.append("")
-        lines.append(
-            f"👤 <b>Người yêu cầu:</b> {requester.full_name}"
-        )
+        lines.append(f"👤 <b>Người yêu cầu:</b> {requester.full_name}")
         lines.append(f"🆔 <b>User ID:</b> <code>{requester.id}</code>")
         if requester.username:
             lines.append(f"🔗 <b>Username:</b> @{requester.username}")
@@ -911,14 +927,15 @@ def build_group_info_text(chat, requester=None):
     return "\n".join(lines)
 
 
+# =========================================================
+# 🆕 SPAM 3 TIN NHẮN CẢNH BÁO CHƯA CẤP QUYỀN
+# =========================================================
+
 async def notify_unauthorized(chat, context, requester=None):
-    """Spam cảnh báo chưa cấp quyền + gửi yêu cầu đến OWNER."""
-    # Chống spam
     if not await can_warn(chat.id):
         logger.info("⏱️ Bỏ qua warn (cooldown): %s", chat.id)
         return
 
-    # Lưu thông tin nhóm vào DB
     await request_group_access(
         chat.id,
         chat.title or "Không tên",
@@ -928,24 +945,40 @@ async def notify_unauthorized(chat, context, requester=None):
 
     owner_mention = f"@{OWNER_USERNAME}" if OWNER_USERNAME else "admin"
 
-    # 1️⃣ Spam cảnh báo lên nhóm
-    try:
-        await context.bot.send_message(
-            chat_id=chat.id,
-            text=(
-                "⚠️ <b>BOT CHƯA ĐƯỢC CẤP QUYỀN SỬ DỤNG</b>\n\n"
-                "🚫 Nhóm này chưa được admin cấp quyền sử dụng bot.\n\n"
-                f"📩 Vui lòng liên hệ admin: <b>{owner_mention}</b>\n"
-                "để được cấp quyền sử dụng.\n\n"
-                "⏳ Đã gửi yêu cầu cấp quyền đến admin, "
-                "vui lòng chờ duyệt."
-            ),
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.error("❌ Không gửi được cảnh báo nhóm %s: %s", chat.id, e)
+    spam_messages = [
+        (
+            "⚠️ <b>THÔNG BÁO QUAN TRỌNG</b> ⚠️\n\n"
+            "🚫 <b>BOT CHƯA ĐƯỢC CẤP QUYỀN SỬ DỤNG</b>\n\n"
+            "Nhóm này chưa được admin cấp quyền sử dụng bot.\n"
+            "Bot sẽ <b>KHÔNG HOẠT ĐỘNG</b> cho đến khi được duyệt."
+        ),
+        (
+            "📩 <b>LIÊN HỆ ADMIN ĐỂ ĐƯỢC CẤP QUYỀN</b>\n\n"
+            f"👤 Admin: <b>{owner_mention}</b>\n\n"
+            "Vui lòng liên hệ admin để được cấp quyền sử dụng bot.\n"
+            "Hoặc admin nhóm có thể dùng lệnh /capquyen trong nhóm này."
+        ),
+        (
+            "⏳ <b>ĐÃ GỬI YÊU CẦU ĐẾN ADMIN</b>\n\n"
+            f"📨 Yêu cầu cấp quyền đã được gửi tới: <b>{owner_mention}</b>\n\n"
+            "Vui lòng chờ admin duyệt.\n"
+            "🔐 Bot sẽ tự động hoạt động sau khi được cấp quyền."
+        ),
+    ]
 
-    # 2️⃣ Gửi yêu cầu đến OWNER kèm nút
+    for idx, msg_text in enumerate(spam_messages, 1):
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=msg_text,
+                parse_mode="HTML",
+            )
+            logger.info("📤 Spam %d/3 → %s", idx, chat.id)
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.error("❌ Không spam được tin %d tới %s: %s", idx, chat.id, e)
+            break
+
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -957,7 +990,13 @@ async def notify_unauthorized(chat, context, requester=None):
                     "❌ TỪ CHỐI",
                     callback_data=f"deny:{chat.id}",
                 ),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    "📋 XEM TẤT CẢ NHÓM CHỜ DUYỆT",
+                    callback_data="pending_list",
+                ),
+            ],
         ]
     )
 
@@ -974,7 +1013,102 @@ async def notify_unauthorized(chat, context, requester=None):
 
 
 # =========================================================
-# 🔐 /CAPQUYEN
+# 🆕 HANDLE BOT JOINED
+# =========================================================
+
+async def handle_bot_joined(chat, context):
+    if await group_enabled(chat.id):
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=(
+                    "🎉 <b>CẢM ƠN ĐÃ THÊM BOT!</b>\n\n"
+                    "🛡️ Nhóm đã được cấp quyền từ trước.\n"
+                    "Bot sẽ tự động kiểm duyệt nội dung 18+."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+        return
+
+    await notify_unauthorized(chat, context, requester=None)
+
+
+# =========================================================
+# 🆕 ON BOT ADDED (NEW_CHAT_MEMBERS)
+# =========================================================
+
+async def on_bot_added(update, context):
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not message or not chat:
+        return
+
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    if not message.new_chat_members:
+        return
+
+    try:
+        me = await context.bot.get_me()
+    except Exception:
+        return
+
+    added = any(m.id == me.id for m in message.new_chat_members)
+
+    if not added:
+        return
+
+    logger.info("🆕 [NEW_CHAT_MEMBERS] Bot vào nhóm: %s (%s)", chat.title, chat.id)
+    await handle_bot_joined(chat, context)
+
+
+# =========================================================
+# 🆕 FALLBACK: Bắt mọi tin nhắn trong nhóm chưa cấp quyền
+# =========================================================
+
+async def fallback_group_detect(update, context):
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not message or not chat:
+        return
+
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    if await group_enabled(chat.id):
+        return
+
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    if message.text and message.text.startswith(
+        ("/capquyen", "/start", "/pending", "/groups", "/admin", "/cap", "/uncap", "/grant")
+    ):
+        return
+
+    try:
+        me = await context.bot.get_me()
+        member = await context.bot.get_chat_member(chat.id, me.id)
+        if member.status not in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.RESTRICTED,
+        ):
+            return
+    except Exception:
+        return
+
+    await notify_unauthorized(chat, context, requester=None)
+
+
+# =========================================================
+# 🔐 /CAPQUYEN (trong nhóm)
 # =========================================================
 
 async def capquyen(update, context):
@@ -989,7 +1123,6 @@ async def capquyen(update, context):
         await message.reply_text("❌ /capquyen chỉ dùng trong nhóm.")
         return
 
-    # Anonymous admin
     if message.sender_chat and message.sender_chat.id == chat.id:
         requester = None
         requester_id = 0
@@ -1006,7 +1139,6 @@ async def capquyen(update, context):
             )
             return
 
-    # Nếu đã được cấp quyền
     if await group_enabled(chat.id):
         await message.reply_text(
             "✅ Nhóm này đã được cấp quyền sử dụng bot rồi.",
@@ -1059,6 +1191,227 @@ async def capquyen(update, context):
 
 
 # =========================================================
+# 🆕 /CAP @username | /cap <chat_id> (OWNER - cấp quyền trực tiếp)
+# =========================================================
+
+async def cap_command(update, context):
+    message = update.effective_message
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Chỉ chủ bot mới dùng được lệnh này.")
+        return
+
+    if not context.args:
+        await message.reply_text(
+            "📖 <b>HƯỚNG DẪN DÙNG /cap</b>\n\n"
+            "• <code>/cap @tennhom</code> — cấp quyền cho nhóm có username\n"
+            "• <code>/cap -1001234567890</code> — cấp quyền cho nhóm theo chat_id\n"
+            "• <code>/cap</code> — xem hướng dẫn này\n\n"
+            "💡 Danh sách nhóm: /pending hoặc /groups",
+            parse_mode="HTML",
+        )
+        return
+
+    arg = context.args[0].strip()
+
+    # =====================================================
+    # XÁC ĐỊNH CHAT_ID
+    # =====================================================
+    target_chat_id = None
+    target_info = None
+
+    # 1️⃣ Theo chat_id (số, có thể âm)
+    if re.fullmatch(r"-?\d+", arg):
+        try:
+            target_chat_id = int(arg)
+            target_info = await find_group_by_chat_id(target_chat_id)
+        except Exception:
+            await message.reply_text("❌ Chat ID không hợp lệ.")
+            return
+
+    # 2️⃣ Theo username
+    elif arg.startswith("@"):
+        target_info = await find_group_by_username(arg)
+        if target_info:
+            target_chat_id = target_info["chat_id"]
+        else:
+            # Thử resolve từ Telegram (nếu bot đã từng ở nhóm đó)
+            try:
+                uname = arg.lstrip("@")
+                chat_obj = await context.bot.get_chat(f"@{uname}")
+                target_chat_id = chat_obj.id
+                target_info = {
+                    "chat_id": chat_obj.id,
+                    "title": chat_obj.title or "Không tên",
+                    "username": chat_obj.username or "",
+                    "enabled": 0,
+                }
+                # Lưu vào DB luôn
+                await request_group_access(
+                    target_chat_id,
+                    target_info["title"],
+                    target_info["username"],
+                    0,
+                )
+            except Exception as e:
+                await message.reply_text(
+                    f"❌ Không tìm thấy nhóm <b>{arg}</b> trong DB.\n\n"
+                    "⚠️ Hãy để user trong nhóm gõ /capquyen trước "
+                    "hoặc dùng /cap &lt;chat_id&gt;.\n\n"
+                    f"<code>{e}</code>",
+                    parse_mode="HTML",
+                )
+                return
+    else:
+        await message.reply_text(
+            "❌ Sai cú pháp.\n\n"
+            "Dùng: <code>/cap @tennhom</code> "
+            "hoặc <code>/cap -1001234567890</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if not target_chat_id:
+        await message.reply_text("❌ Không xác định được nhóm.")
+        return
+
+    # =====================================================
+    # KIỂM TRA ĐÃ CẤP QUYỀN CHƯA
+    # =====================================================
+    already = await group_enabled(target_chat_id)
+    if already:
+        await message.reply_text(
+            f"ℹ️ Nhóm <b>{target_info.get('title', target_chat_id)}</b> "
+            f"đã được cấp quyền từ trước.\n\n"
+            f"🆔 <code>{target_chat_id}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # =====================================================
+    # CẤP QUYỀN
+    # =====================================================
+    await approve_group(target_chat_id)
+
+    title = target_info.get("title") if target_info else None
+    username = target_info.get("username") if target_info else None
+
+    confirm_text = (
+        "✅ <b>ĐÃ CẤP QUYỀN THÀNH CÔNG</b>\n\n"
+        f"📌 Nhóm: <b>{title or 'Không tên'}</b>\n"
+        f"🆔 Chat ID: <code>{target_chat_id}</code>\n"
+    )
+    if username:
+        confirm_text += f"🔗 Username: @{username}\n"
+
+    confirm_text += (
+        "\n🤖 Bot đã sẵn sàng hoạt động trong nhóm này."
+    )
+
+    await message.reply_text(confirm_text, parse_mode="HTML")
+
+    # Gửi thông báo vào nhóm (nếu bot ở trong nhóm)
+    try:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=(
+                "🎉 <b>BOT ĐÃ ĐƯỢC CẤP QUYỀN!</b>\n\n"
+                "🛡️ Hệ thống kiểm duyệt đã bật.\n\n"
+                "🖼️ Ảnh → quét\n"
+                "🎨 Sticker → quét\n"
+                "🚫 Video → bỏ qua\n\n"
+                "🔇 Vi phạm 1-2 → mute 2 phút\n"
+                "🔨 Vi phạm 3 → ban vĩnh viễn"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("⚠️ Không gửi được thông báo vào nhóm %s: %s", target_chat_id, e)
+        await message.reply_text(
+            "⚠️ Đã cấp quyền trong DB nhưng <b>không gửi được thông báo "
+            "vào nhóm</b> (bot có thể chưa ở trong nhóm đó).",
+            parse_mode="HTML",
+        )
+
+
+# =========================================================
+# 🆕 /UNCAP @username | /uncap <chat_id> (OWNER - thu hồi quyền)
+# =========================================================
+
+async def uncap_command(update, context):
+    message = update.effective_message
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Chỉ chủ bot mới dùng được lệnh này.")
+        return
+
+    if not context.args:
+        await message.reply_text(
+            "📖 <b>HƯỚNG DẪN DÙNG /uncap</b>\n\n"
+            "• <code>/uncap @tennhom</code> — thu hồi quyền nhóm\n"
+            "• <code>/uncap -1001234567890</code> — thu hồi theo chat_id",
+            parse_mode="HTML",
+        )
+        return
+
+    arg = context.args[0].strip()
+    target_chat_id = None
+    target_info = None
+
+    if re.fullmatch(r"-?\d+", arg):
+        try:
+            target_chat_id = int(arg)
+            target_info = await find_group_by_chat_id(target_chat_id)
+        except Exception:
+            await message.reply_text("❌ Chat ID không hợp lệ.")
+            return
+    elif arg.startswith("@"):
+        target_info = await find_group_by_username(arg)
+        if target_info:
+            target_chat_id = target_info["chat_id"]
+    else:
+        await message.reply_text("❌ Sai cú pháp.")
+        return
+
+    if not target_chat_id:
+        await message.reply_text(f"❌ Không tìm thấy nhóm <b>{arg}</b> trong DB.", parse_mode="HTML")
+        return
+
+    if not await group_enabled(target_chat_id):
+        await message.reply_text(
+            f"ℹ️ Nhóm <b>{target_info.get('title', target_chat_id)}</b> "
+            f"chưa được cấp quyền.",
+            parse_mode="HTML",
+        )
+        return
+
+    await disable_group(target_chat_id)
+
+    await message.reply_text(
+        "🚫 <b>ĐÃ THU HỒI QUYỀN</b>\n\n"
+        f"📌 Nhóm: <b>{target_info.get('title', 'Không tên')}</b>\n"
+        f"🆔 Chat ID: <code>{target_chat_id}</code>",
+        parse_mode="HTML",
+    )
+
+    # Thông báo vào nhóm
+    try:
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text=(
+                "🚫 <b>BOT ĐÃ BỊ THU HỒI QUYỀN</b>\n\n"
+                "Bot sẽ không hoạt động trong nhóm này nữa.\n"
+                "Liên hệ admin nếu cần hỗ trợ."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+# =========================================================
 # 🔘 CALLBACK
 # =========================================================
 
@@ -1071,7 +1424,70 @@ async def callback_handler(update, context):
     data = query.data or ""
 
     # =====================================================
-    # APPROVE
+    # 📋 PENDING LIST
+    # =====================================================
+    if data == "pending_list":
+        if query.from_user.id != OWNER_ID:
+            await query.answer("❌ Bạn không có quyền.", show_alert=True)
+            return
+
+        conn = get_db()
+        try:
+            rows = conn.execute(
+                "SELECT chat_id, title, username, requested_at FROM groups WHERE enabled = 0 ORDER BY requested_at DESC LIMIT 20"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            await query.answer("✅ Không có nhóm nào chờ duyệt.", show_alert=True)
+            return
+
+        text_lines = ["📋 <b>DANH SÁCH NHÓM CHỜ DUYỆT</b>\n"]
+        buttons = []
+
+        for r in rows:
+            title = r["title"] or "Không tên"
+            uname = f" (@{r['username']})" if r["username"] else ""
+            text_lines.append(
+                f"• <b>{title}</b>{uname}\n"
+                f"  🆔 <code>{r['chat_id']}</code>"
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"✅ {title[:20]}",
+                        callback_data=f"approve:{r['chat_id']}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌",
+                        callback_data=f"deny:{r['chat_id']}",
+                    ),
+                ]
+            )
+
+        buttons.append(
+            [InlineKeyboardButton("🔄 LÀM MỚI", callback_data="pending_list")]
+        )
+
+        try:
+            await query.edit_message_text(
+                "\n".join(text_lines),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+        except Exception:
+            await query.message.reply_text(
+                "\n".join(text_lines),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(buttons),
+            )
+
+        await query.answer()
+        return
+
+    # =====================================================
+    # ✅ APPROVE
     # =====================================================
     if data.startswith("approve:"):
         if query.from_user.id != OWNER_ID:
@@ -1115,7 +1531,7 @@ async def callback_handler(update, context):
         return
 
     # =====================================================
-    # DENY
+    # ❌ DENY
     # =====================================================
     if data.startswith("deny:"):
         if query.from_user.id != OWNER_ID:
@@ -1146,7 +1562,7 @@ async def callback_handler(update, context):
                 text=(
                     "❌ <b>YÊU CẦU CẤP QUYỀN ĐÃ BỊ TỪ CHỐI</b>\n\n"
                     "Bot sẽ không hoạt động trong nhóm này.\n"
-                    f"Liên hệ admin nếu cần hỗ trợ."
+                    "Liên hệ admin nếu cần hỗ trợ."
                 ),
                 parse_mode="HTML",
             )
@@ -1155,7 +1571,7 @@ async def callback_handler(update, context):
         return
 
     # =====================================================
-    # UNMUTE
+    # 🔊 UNMUTE
     # =====================================================
     if data.startswith("unmute:"):
         parts = data.split(":")
@@ -1181,7 +1597,7 @@ async def callback_handler(update, context):
         return
 
     # =====================================================
-    # CANCEL MUTE
+    # ❌ CANCEL MUTE
     # =====================================================
     if data.startswith("cancelmute:"):
         parts = data.split(":")
@@ -1203,7 +1619,7 @@ async def callback_handler(update, context):
         return
 
     # =====================================================
-    # UNBAN
+    # 🔓 UNBAN
     # =====================================================
     if data.startswith("unban:"):
         parts = data.split(":")
@@ -1229,7 +1645,7 @@ async def callback_handler(update, context):
         return
 
     # =====================================================
-    # CANCEL BAN
+    # ❌ CANCEL BAN
     # =====================================================
     if data.startswith("cancelban:"):
         parts = data.split(":")
@@ -1277,7 +1693,6 @@ async def should_ignore_message(update, context):
             return True
         await save_known_user(chat.id, user)
 
-    # 🔐 Chưa được cấp quyền → không xử lý ảnh
     if not await group_enabled(chat.id):
         return True
 
@@ -1352,7 +1767,6 @@ async def process_photo(update, context):
         if not result["is_nsfw"]:
             return
 
-        # 🗑️ Xoá tin nhắn
         try:
             await message.delete()
         except Exception as e:
@@ -1363,9 +1777,6 @@ async def process_photo(update, context):
 
         count = await add_violation(chat.id, user.id, username, full_name)
 
-        # =================================================
-        # 🔇 VI PHẠM 1-2
-        # =================================================
         if count < MAX_VIOLATIONS:
             try:
                 await mute_user(context.bot, chat.id, user.id, MUTE_MINUTES)
@@ -1411,10 +1822,6 @@ async def process_photo(update, context):
                     ),
                     parse_mode="HTML",
                 )
-
-        # =================================================
-        # 🔨 VI PHẠM LẦN 3
-        # =================================================
         else:
             try:
                 await ban_user(context.bot, chat.id, user.id)
@@ -1564,7 +1971,6 @@ async def mute_command(update, context):
 
     minutes = MUTE_MINUTES
 
-    # Nếu có args và arg cuối là số → đó là số phút
     if context.args and re.fullmatch(r"\d+", context.args[-1]):
         try:
             minutes = max(1, int(context.args[-1]))
@@ -1703,6 +2109,99 @@ async def trangthai(update, context):
 
 
 # =========================================================
+# 🆕 /PENDING
+# =========================================================
+
+async def pending_command(update, context):
+    message = update.effective_message
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Chỉ chủ bot mới dùng được.")
+        return
+
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT chat_id, title, username, requested_at FROM groups WHERE enabled = 0 ORDER BY requested_at DESC LIMIT 30"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        await message.reply_text("✅ Không có nhóm nào chờ duyệt.")
+        return
+
+    text_lines = ["📋 <b>DANH SÁCH NHÓM CHỜ DUYỆT</b>\n"]
+    buttons = []
+
+    for r in rows:
+        title = r["title"] or "Không tên"
+        uname = f" (@{r['username']})" if r["username"] else ""
+        text_lines.append(
+            f"• <b>{title}</b>{uname}\n"
+            f"  🆔 <code>{r['chat_id']}</code>"
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ {title[:20]}",
+                    callback_data=f"approve:{r['chat_id']}",
+                ),
+                InlineKeyboardButton(
+                    "❌",
+                    callback_data=f"deny:{r['chat_id']}",
+                ),
+            ]
+        )
+
+    buttons.append(
+        [InlineKeyboardButton("🔄 LÀM MỚI", callback_data="pending_list")]
+    )
+
+    await message.reply_text(
+        "\n".join(text_lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# =========================================================
+# 🆕 /GROUPS
+# =========================================================
+
+async def groups_command(update, context):
+    message = update.effective_message
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await message.reply_text("❌ Chỉ chủ bot mới dùng được.")
+        return
+
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT chat_id, title, username, approved_at FROM groups WHERE enabled = 1 ORDER BY approved_at DESC LIMIT 30"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        await message.reply_text("📭 Chưa có nhóm nào được cấp quyền.")
+        return
+
+    text_lines = ["✅ <b>NHÓM ĐÃ CẤP QUYỀN</b>\n"]
+    for r in rows:
+        uname = f" (@{r['username']})" if r["username"] else ""
+        text_lines.append(
+            f"• <b>{r['title'] or 'Không tên'}</b>{uname}\n"
+            f"  🆔 <code>{r['chat_id']}</code>"
+        )
+
+    await message.reply_text("\n".join(text_lines), parse_mode="HTML")
+
+
+# =========================================================
 # ❌ ERROR
 # =========================================================
 
@@ -1729,21 +2228,16 @@ def main():
         .build()
     )
 
-    # COMMANDS
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("capquyen", capquyen))
-    application.add_handler(CommandHandler("botcheck", botcheck))
-    application.add_handler(CommandHandler("trangthai", trangthai))
-    application.add_handler(CommandHandler("tb", tb_command))
-    application.add_handler(CommandHandler("mute", mute_command))
-    application.add_handler(CommandHandler("unmute", unmute_command))
-    application.add_handler(CommandHandler("vipham", vipham))
-    application.add_handler(CommandHandler("resetvipham", resetvipham))
+    # GROUP -2: Fallback phát hiện nhóm chưa cấp quyền
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL,
+            fallback_group_detect,
+        ),
+        group=-2,
+    )
 
-    # CALLBACK
-    application.add_handler(CallbackQueryHandler(callback_handler))
-
-    # 🆕 Bắt sự kiện bot được thêm vào nhóm
+    # GROUP -1: Bắt sự kiện bot được thêm vào nhóm
     application.add_handler(
         MessageHandler(
             filters.StatusUpdate.NEW_CHAT_MEMBERS,
@@ -1751,6 +2245,26 @@ def main():
         ),
         group=-1,
     )
+
+    # COMMANDS
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("capquyen", capquyen))
+    application.add_handler(CommandHandler("cap", cap_command))       # 🆕
+    application.add_handler(CommandHandler("grant", cap_command))     # 🆕 alias
+    application.add_handler(CommandHandler("uncap", uncap_command))   # 🆕
+    application.add_handler(CommandHandler("botcheck", botcheck))
+    application.add_handler(CommandHandler("trangthai", trangthai))
+    application.add_handler(CommandHandler("tb", tb_command))
+    application.add_handler(CommandHandler("mute", mute_command))
+    application.add_handler(CommandHandler("unmute", unmute_command))
+    application.add_handler(CommandHandler("vipham", vipham))
+    application.add_handler(CommandHandler("resetvipham", resetvipham))
+    application.add_handler(CommandHandler("pending", pending_command))
+    application.add_handler(CommandHandler("groups", groups_command))
+    application.add_handler(CommandHandler("admin", pending_command))
+
+    # CALLBACK
+    application.add_handler(CallbackQueryHandler(callback_handler))
 
     # MEDIA
     media_filter = (
