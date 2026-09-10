@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import sqlite3
 import asyncio
 import logging
@@ -44,11 +45,11 @@ except Exception:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-OWNER_ID = int(os.getenv("OWNER_ID", "7449833411"))
+OWNER_ID = int(os.getenv("OWNER_ID") or "7449833411")
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "@echcuto")
 
 NSFW_THRESHOLD = float(
-    os.getenv("NSFW_THRESHOLD", "0.75")
+    os.getenv("NSFW_THRESHOLD") or "0.75"
 )
 
 WARN_USER = os.getenv(
@@ -56,11 +57,12 @@ WARN_USER = os.getenv(
 ).lower() in ("1", "true", "yes")
 
 AUTO_MUTE_MINUTES = int(
-    os.getenv("AUTO_MUTE_MINUTES", "2")
+    os.getenv("AUTO_MUTE_MINUTES") or "2"
 )
 
+# Đã sửa mặc định thành 'data' để tránh lỗi PermissionError trên Server/Railway
 DATA_DIR = Path(
-    os.getenv("DATA_DIR", "/data")
+    os.getenv("DATA_DIR", "data")
 )
 
 DATA_DIR.mkdir(
@@ -70,11 +72,8 @@ DATA_DIR.mkdir(
 
 DB_PATH = DATA_DIR / "bot.db"
 
-# Số ảnh AI được quét cùng lúc.
-# Railway yếu thì để 1.
-# Railway khỏe có thể thử 2.
 MAX_AI_CONCURRENT = int(
-    os.getenv("MAX_AI_CONCURRENT", "2")
+    os.getenv("MAX_AI_CONCURRENT") or "2"
 )
 
 
@@ -305,10 +304,7 @@ class NsfwDetector:
     def __init__(self):
 
         self.pipe = None
-
-        self.ai_semaphore = asyncio.Semaphore(
-            MAX_AI_CONCURRENT
-        )
+        self.ai_semaphore = None  # Khởi tạo Semaphore lười khi Event Loop chạy
 
         if pipeline is None:
 
@@ -371,7 +367,6 @@ class NsfwDetector:
                 image_path
             )
 
-            # Sửa hướng ảnh theo EXIF
             if ImageOps is not None:
 
                 image = ImageOps.exif_transpose(
@@ -382,7 +377,6 @@ class NsfwDetector:
                 "RGB"
             )
 
-            # Resize để AI xử lý nhanh hơn
             image.thumbnail(
                 (512, 512)
             )
@@ -445,10 +439,11 @@ class NsfwDetector:
         threshold
     ):
 
-        # Giới hạn số AI chạy cùng lúc
+        if self.ai_semaphore is None:
+            self.ai_semaphore = asyncio.Semaphore(MAX_AI_CONCURRENT)
+
         async with self.ai_semaphore:
 
-            # Đẩy AI CPU nặng ra thread
             return await asyncio.to_thread(
                 self._check_image_sync,
                 image_path,
@@ -681,14 +676,9 @@ async def check_group_access(
 
         return True
 
-    # Chỉ thông báo một lần
     if not group_was_notified(
         chat.id
     ):
-
-        set_group_notified(
-            chat.id
-        )
 
         try:
 
@@ -721,23 +711,25 @@ async def check_group_access(
         ])
 
         try:
+            title_escaped = html.escape(chat.title or "Nhóm")
+            username_str = f"@{chat.username}" if chat.username else "Không có"
 
+            # Đổi sang parse_mode HTML để chống lỗi ký tự đặc biệt làm vỡ Markdown
             await context.bot.send_message(
                 chat_id=OWNER_ID,
                 text=(
-                    "📥 YÊU CẦU CẤP QUYỀN NHÓM\n\n"
-                    f"🏷 Tên: {chat.title}\n"
-                    f"🆔 ID: `{chat.id}`\n"
-                    f"🔗 Username: "
-                    f"@{chat.username}"
-                    if chat.username
-                    else
-                    f"📥 YÊU CẦU CẤP QUYỀN NHÓM\n\n"
-                    f"🏷 Tên: {chat.title}\n"
-                    f"🆔 ID: `{chat.id}`"
+                    "📥 <b>YÊU CẦU CẤP QUYỀN NHÓM</b>\n\n"
+                    f"🏷 Tên: {title_escaped}\n"
+                    f"🆔 ID: <code>{chat.id}</code>\n"
+                    f"🔗 Username: {username_str}"
                 ),
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=keyboard
+            )
+
+            # Chỉ set đã thông báo khi gửi tin nhắn cho Owner thành công
+            set_group_notified(
+                chat.id
             )
 
         except Exception:
@@ -1081,11 +1073,12 @@ async def mute_command(
 
     if success:
 
+        title_escaped = html.escape(chat.title or "Nhóm")
         await update.message.reply_text(
-            f"✅ Đã mute `{user_id}` "
-            f"trong nhóm `{chat.title}` "
+            f"✅ Đã mute <code>{user_id}</code> "
+            f"trong nhóm <b>{title_escaped}</b> "
             f"thời gian {context.args[2]}.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
     else:
@@ -1157,10 +1150,11 @@ async def unmute_command(
             user_id
         )
 
+        title_escaped = html.escape(chat.title or "Nhóm")
         await update.message.reply_text(
-            f"✅ Đã unmute `{user_id}` "
-            f"trong `{chat.title}`.",
-            parse_mode="Markdown"
+            f"✅ Đã unmute <code>{user_id}</code> "
+            f"trong <b>{title_escaped}</b>.",
+            parse_mode="HTML"
         )
 
     except Exception:
@@ -1260,7 +1254,6 @@ async def process_photo(
 
         return
 
-    # Lấy file_id phù hợp từ Ảnh, Sticker, GIF hoặc Document
     target_file_id = None
 
     if message.photo:
@@ -1289,7 +1282,6 @@ async def process_photo(
         message.message_id
     )
 
-    # Kiểm tra nhóm có quyền
     allowed = await check_group_access(
         update,
         context
@@ -1299,7 +1291,6 @@ async def process_photo(
 
         return
 
-    # Bỏ qua admin
     if user:
 
         if await is_admin(
@@ -1319,7 +1310,6 @@ async def process_photo(
 
     try:
 
-        # Tạo file tạm
         with tempfile.NamedTemporaryFile(
             suffix=".jpg",
             delete=False
@@ -1356,7 +1346,6 @@ async def process_photo(
             result
         )
 
-        # Nếu detector lỗi thì KHÔNG xoá ảnh
         if result["status"] != "ok":
 
             logger.error(
@@ -1384,7 +1373,6 @@ async def process_photo(
             result["score"]
         )
 
-        # Xoá ảnh NGAY
         try:
 
             await message.delete()
@@ -1401,7 +1389,6 @@ async def process_photo(
                 message.message_id
             )
 
-        # Mute người gửi
         if user:
 
             duration = timedelta(
@@ -1415,7 +1402,6 @@ async def process_photo(
                 duration
             )
 
-            # Cảnh báo
             if WARN_USER:
 
                 try:
@@ -1466,10 +1452,6 @@ async def handle_group_messages(
     update,
     context
 ):
-
-    # Không xử lý video.
-    # Chỉ dùng handler này để phát hiện nhóm
-    # chưa được cấp quyền.
 
     if update.effective_chat is None:
 
@@ -1525,17 +1507,9 @@ def main():
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-
-        # Cho phép xử lý nhiều update
-        # thay vì chờ từng ảnh một.
         .concurrent_updates(10)
-
         .build()
     )
-
-    # -----------------------------
-    # COMMANDS
-    # -----------------------------
 
     application.add_handler(
         CommandHandler(
@@ -1572,19 +1546,11 @@ def main():
         )
     )
 
-    # -----------------------------
-    # ADMIN BUTTON
-    # -----------------------------
-
     application.add_handler(
         CallbackQueryHandler(
             button_callback
         )
     )
-
-    # -----------------------------
-    # PHOTO & STICKERS & GIFS & DOCUMENTS
-    # -----------------------------
 
     media_filter = (
         filters.PHOTO
@@ -1599,10 +1565,6 @@ def main():
             process_photo
         )
     )
-
-    # -----------------------------
-    # OTHER GROUP MESSAGES
-    # -----------------------------
 
     application.add_handler(
         MessageHandler(
