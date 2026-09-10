@@ -1199,10 +1199,10 @@ async def start_command(
 
     await update.message.reply_text(
         "🤖 NSFW MODERATION BOT\n\n"
-        "Bot tự động kiểm tra ảnh được gửi "
+        "Bot tự động kiểm tra ảnh/sticker được gửi "
         "trong nhóm.\n\n"
-        "🔞 Phát hiện ảnh 18+\n"
-        "🗑 Tự động xoá ảnh\n"
+        "🔞 Phát hiện nội dung 18+\n"
+        "🗑 Tự động xoá tin nhắn\n"
         f"🔇 Tự động mute {AUTO_MUTE_MINUTES} phút\n"
         "👮 Bỏ qua admin\n\n"
         "⚡ Không quét video."
@@ -1237,7 +1237,7 @@ async def is_admin(
 
 
 # =========================================================
-# PROCESS PHOTO
+# PROCESS PHOTO & STICKERS / ANIMATIONS
 # =========================================================
 
 async def process_photo(
@@ -1260,8 +1260,30 @@ async def process_photo(
 
         return
 
+    # Lấy file_id phù hợp từ Ảnh, Sticker, GIF hoặc Document
+    target_file_id = None
+
+    if message.photo:
+        target_file_id = message.photo[-1].file_id
+    elif message.sticker:
+        if message.sticker.thumbnail:
+            target_file_id = message.sticker.thumbnail.file_id
+        else:
+            target_file_id = message.sticker.file_id
+    elif message.animation:
+        if message.animation.thumbnail:
+            target_file_id = message.animation.thumbnail.file_id
+    elif message.document:
+        if message.document.mime_type and message.document.mime_type.startswith("image/"):
+            target_file_id = message.document.file_id
+        elif message.document.thumbnail:
+            target_file_id = message.document.thumbnail.file_id
+
+    if not target_file_id:
+        return
+
     logger.info(
-        "📷 Nhận ảnh | chat=%s user=%s message=%s",
+        "📷 Nhận file | chat=%s user=%s message=%s",
         chat.id,
         user.id if user else None,
         message.message_id
@@ -1293,9 +1315,6 @@ async def process_photo(
 
             return
 
-    # Lấy ảnh lớn nhất
-    photo = message.photo[-1]
-
     temp_path = None
 
     try:
@@ -1314,7 +1333,7 @@ async def process_photo(
         )
 
         telegram_file = await context.bot.get_file(
-            photo.file_id
+            target_file_id
         )
 
         await telegram_file.download_to_drive(
@@ -1564,12 +1583,19 @@ def main():
     )
 
     # -----------------------------
-    # PHOTO ONLY
+    # PHOTO & STICKERS & GIFS & DOCUMENTS
     # -----------------------------
+
+    media_filter = (
+        filters.PHOTO
+        | filters.STICKER
+        | filters.ANIMATION
+        | filters.Document.IMAGE
+    )
 
     application.add_handler(
         MessageHandler(
-            filters.PHOTO,
+            media_filter,
             process_photo
         )
     )
@@ -1582,7 +1608,7 @@ def main():
         MessageHandler(
             filters.ChatType.GROUPS
             & (~filters.COMMAND)
-            & (~filters.PHOTO),
+            & (~media_filter),
             handle_group_messages
         )
     )
