@@ -23,6 +23,7 @@ from telegram.ext import (
     filters,
 )
 
+
 # =========================================================
 # OPTIONAL LIBRARIES
 # =========================================================
@@ -45,22 +46,37 @@ except Exception:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-OWNER_ID = int(os.getenv("OWNER_ID") or "7449833411")
-OWNER_USERNAME = os.getenv("OWNER_USERNAME", "@echcuto")
+OWNER_ID = int(
+    os.getenv("OWNER_ID") or "7449833411"
+)
+
+OWNER_USERNAME = os.getenv(
+    "OWNER_USERNAME",
+    "@echcuto"
+)
 
 NSFW_THRESHOLD = float(
     os.getenv("NSFW_THRESHOLD") or "0.75"
 )
 
 WARN_USER = os.getenv(
-    "WARN_USER", "true"
-).lower() in ("1", "true", "yes")
+    "WARN_USER",
+    "true"
+).lower() in (
+    "1",
+    "true",
+    "yes"
+)
 
 AUTO_MUTE_MINUTES = int(
     os.getenv("AUTO_MUTE_MINUTES") or "2"
 )
 
-# Đã sửa mặc định thành 'data' để tránh lỗi PermissionError trên Server/Railway
+# Số lần vi phạm tối đa trước khi ban
+MAX_VIOLATIONS = int(
+    os.getenv("MAX_VIOLATIONS") or "3"
+)
+
 DATA_DIR = Path(
     os.getenv("DATA_DIR", "data")
 )
@@ -104,6 +120,10 @@ def db_connect():
         "PRAGMA journal_mode=WAL"
     )
 
+    conn.execute(
+        "PRAGMA busy_timeout=30000"
+    )
+
     return conn
 
 
@@ -112,6 +132,10 @@ def init_db():
     conn = db_connect()
 
     cur = conn.cursor()
+
+    # -----------------------------------------------------
+    # GROUPS
+    # -----------------------------------------------------
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS groups (
@@ -124,6 +148,10 @@ def init_db():
         )
     """)
 
+    # -----------------------------------------------------
+    # MUTES
+    # -----------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS mutes (
             chat_id INTEGER,
@@ -133,11 +161,31 @@ def init_db():
         )
     """)
 
+    # -----------------------------------------------------
+    # VIOLATIONS
+    # -----------------------------------------------------
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS violations (
+            chat_id INTEGER,
+            user_id INTEGER,
+            count INTEGER DEFAULT 0,
+            updated_at TEXT,
+            PRIMARY KEY(chat_id, user_id)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
-    logger.info("Database initialized")
+    logger.info(
+        "Database initialized"
+    )
 
+
+# =========================================================
+# GROUP DATABASE
+# =========================================================
 
 def save_group(
     chat_id,
@@ -149,8 +197,16 @@ def save_group(
 
     conn.execute("""
         INSERT INTO groups
-        (chat_id, username, title, enabled, notified, created_at)
+        (
+            chat_id,
+            username,
+            title,
+            enabled,
+            notified,
+            created_at
+        )
         VALUES (?, ?, ?, 0, 0, ?)
+
         ON CONFLICT(chat_id)
         DO UPDATE SET
             username = excluded.username,
@@ -173,7 +229,10 @@ def get_all_groups():
     conn = db_connect()
 
     rows = conn.execute("""
-        SELECT chat_id, username, title
+        SELECT
+            chat_id,
+            username,
+            title
         FROM groups
         WHERE enabled = 1
     """).fetchall()
@@ -183,7 +242,9 @@ def get_all_groups():
     return rows
 
 
-def group_enabled(chat_id):
+def group_enabled(
+    chat_id
+):
 
     conn = db_connect()
 
@@ -191,7 +252,9 @@ def group_enabled(chat_id):
         SELECT enabled
         FROM groups
         WHERE chat_id = ?
-    """, (chat_id,)).fetchone()
+    """, (
+        chat_id,
+    )).fetchone()
 
     conn.close()
 
@@ -220,7 +283,9 @@ def set_group_enabled(
     conn.close()
 
 
-def group_was_notified(chat_id):
+def group_was_notified(
+    chat_id
+):
 
     conn = db_connect()
 
@@ -228,7 +293,9 @@ def group_was_notified(chat_id):
         SELECT notified
         FROM groups
         WHERE chat_id = ?
-    """, (chat_id,)).fetchone()
+    """, (
+        chat_id,
+    )).fetchone()
 
     conn.close()
 
@@ -237,7 +304,9 @@ def group_was_notified(chat_id):
     )
 
 
-def set_group_notified(chat_id):
+def set_group_notified(
+    chat_id
+):
 
     conn = db_connect()
 
@@ -245,11 +314,160 @@ def set_group_notified(chat_id):
         UPDATE groups
         SET notified = 1
         WHERE chat_id = ?
-    """, (chat_id,))
+    """, (
+        chat_id,
+    ))
 
     conn.commit()
     conn.close()
 
+
+# =========================================================
+# VIOLATION SYSTEM
+# =========================================================
+
+def add_violation(
+    chat_id,
+    user_id
+):
+    """
+    Tăng số lần vi phạm một cách an toàn.
+
+    Dùng transaction IMMEDIATE để tránh trường hợp
+    nhiều ảnh được xử lý đồng thời làm sai số lần.
+    """
+
+    conn = db_connect()
+
+    try:
+
+        conn.execute(
+            "BEGIN IMMEDIATE"
+        )
+
+        row = conn.execute("""
+            SELECT count
+            FROM violations
+            WHERE chat_id = ?
+            AND user_id = ?
+        """, (
+            chat_id,
+            user_id
+        )).fetchone()
+
+        if row:
+
+            count = int(
+                row[0]
+            ) + 1
+
+            conn.execute("""
+                UPDATE violations
+                SET
+                    count = ?,
+                    updated_at = ?
+                WHERE chat_id = ?
+                AND user_id = ?
+            """, (
+                count,
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
+                chat_id,
+                user_id
+            ))
+
+        else:
+
+            count = 1
+
+            conn.execute("""
+                INSERT INTO violations
+                (
+                    chat_id,
+                    user_id,
+                    count,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?)
+            """, (
+                chat_id,
+                user_id,
+                count,
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+            ))
+
+        conn.commit()
+
+        return count
+
+    except Exception:
+
+        conn.rollback()
+
+        logger.exception(
+            "Không thể tăng violation."
+        )
+
+        return 0
+
+    finally:
+
+        conn.close()
+
+
+def get_violation_count(
+    chat_id,
+    user_id
+):
+
+    conn = db_connect()
+
+    row = conn.execute("""
+        SELECT count
+        FROM violations
+        WHERE chat_id = ?
+        AND user_id = ?
+    """, (
+        chat_id,
+        user_id
+    )).fetchone()
+
+    conn.close()
+
+    if not row:
+        return 0
+
+    return int(
+        row[0]
+    )
+
+
+def reset_violations(
+    chat_id,
+    user_id
+):
+
+    conn = db_connect()
+
+    conn.execute("""
+        DELETE FROM violations
+        WHERE chat_id = ?
+        AND user_id = ?
+    """, (
+        chat_id,
+        user_id
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# MUTE DATABASE
+# =========================================================
 
 def save_mute(
     chat_id,
@@ -261,10 +479,16 @@ def save_mute(
 
     conn.execute("""
         INSERT INTO mutes
-        (chat_id, user_id, until_ts)
+        (
+            chat_id,
+            user_id,
+            until_ts
+        )
         VALUES (?, ?, ?)
+
         ON CONFLICT(chat_id, user_id)
-        DO UPDATE SET until_ts = excluded.until_ts
+        DO UPDATE SET
+            until_ts = excluded.until_ts
     """, (
         chat_id,
         user_id,
@@ -304,7 +528,7 @@ class NsfwDetector:
     def __init__(self):
 
         self.pipe = None
-        self.ai_semaphore = None  # Khởi tạo Semaphore lười khi Event Loop chạy
+        self.ai_semaphore = None
 
         if pipeline is None:
 
@@ -337,7 +561,6 @@ class NsfwDetector:
             )
 
             self.pipe = None
-
 
     def _check_image_sync(
         self,
@@ -396,11 +619,17 @@ class NsfwDetector:
             for result in results:
 
                 label = str(
-                    result.get("label", "")
+                    result.get(
+                        "label",
+                        ""
+                    )
                 ).lower()
 
                 score = float(
-                    result.get("score", 0)
+                    result.get(
+                        "score",
+                        0
+                    )
                 )
 
                 if label == "nsfw":
@@ -410,13 +639,11 @@ class NsfwDetector:
                         score
                     )
 
-            is_nsfw = (
-                nsfw_score >= threshold
-            )
-
             return {
                 "status": "ok",
-                "is_nsfw": is_nsfw,
+                "is_nsfw": (
+                    nsfw_score >= threshold
+                ),
                 "score": nsfw_score
             }
 
@@ -432,7 +659,6 @@ class NsfwDetector:
                 "score": 0
             }
 
-
     async def check_image(
         self,
         image_path,
@@ -440,7 +666,10 @@ class NsfwDetector:
     ):
 
         if self.ai_semaphore is None:
-            self.ai_semaphore = asyncio.Semaphore(MAX_AI_CONCURRENT)
+
+            self.ai_semaphore = asyncio.Semaphore(
+                MAX_AI_CONCURRENT
+            )
 
         async with self.ai_semaphore:
 
@@ -458,20 +687,59 @@ detector = NsfwDetector()
 # OWNER
 # =========================================================
 
-def is_owner(update):
+def is_owner(
+    update
+):
 
     user = update.effective_user
 
     return bool(
-        user and user.id == OWNER_ID
+        user
+        and user.id == OWNER_ID
     )
+
+
+# =========================================================
+# ADMIN CHECK
+# =========================================================
+
+async def is_admin(
+    context,
+    chat_id,
+    user_id
+):
+
+    if user_id == OWNER_ID:
+        return True
+
+    try:
+
+        member = await context.bot.get_chat_member(
+            chat_id,
+            user_id
+        )
+
+        return member.status in (
+            "administrator",
+            "creator"
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Không kiểm tra được quyền admin."
+        )
+
+        return False
 
 
 # =========================================================
 # DURATION
 # =========================================================
 
-def parse_duration(value):
+def parse_duration(
+    value
+):
 
     match = re.fullmatch(
         r"(\d+)(p|h|n|t)",
@@ -479,6 +747,7 @@ def parse_duration(value):
     )
 
     if not match:
+
         return None
 
     number = int(
@@ -488,24 +757,29 @@ def parse_duration(value):
     unit = match.group(2)
 
     if number <= 0:
+
         return None
 
     if unit == "p":
+
         return timedelta(
             minutes=number
         )
 
     if unit == "h":
+
         return timedelta(
             hours=number
         )
 
     if unit == "n":
+
         return timedelta(
             days=number
         )
 
     if unit == "t":
+
         return timedelta(
             days=number * 30
         )
@@ -528,17 +802,13 @@ async def resolve_group(
 
         if value.startswith("@"):
 
-            chat = await context.bot.get_chat(
+            return await context.bot.get_chat(
                 value
             )
 
-        else:
-
-            chat = await context.bot.get_chat(
-                int(value)
-            )
-
-        return chat
+        return await context.bot.get_chat(
+            int(value)
+        )
 
     except Exception:
 
@@ -595,7 +865,7 @@ def normal_permissions():
 
 
 # =========================================================
-# MUTE
+# MUTE USER
 # =========================================================
 
 async def mute_user(
@@ -622,11 +892,13 @@ async def mute_user(
         save_mute(
             chat_id,
             user_id,
-            int(until_dt.timestamp())
+            int(
+                until_dt.timestamp()
+            )
         )
 
         logger.info(
-            "Muted user %s in %s until %s",
+            "Muted user=%s chat=%s until=%s",
             user_id,
             chat_id,
             until_dt
@@ -645,6 +917,196 @@ async def mute_user(
 
 
 # =========================================================
+# SEND ADMIN MUTE NOTIFICATION
+# =========================================================
+
+async def send_mute_admin_notification(
+    context,
+    chat,
+    user,
+    violation_count
+):
+
+    username = (
+        f"@{user.username}"
+        if user.username
+        else "Không có username"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔓 MỞ MUTE",
+                callback_data=(
+                    f"unmute:{chat.id}:{user.id}"
+                )
+            ),
+            InlineKeyboardButton(
+                "❌ HUỶ",
+                callback_data=(
+                    f"cancelmute:{chat.id}:{user.id}"
+                )
+            )
+        ]
+    ])
+
+    text = (
+        "🔇 <b>THÔNG BÁO MUTE</b>\n\n"
+        f"👤 Người dùng: {user.mention_html()}\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"👤 Username: {html.escape(username)}\n"
+        f"🏷 Nhóm: <b>{html.escape(chat.title or 'Nhóm')}</b>\n"
+        f"⚠️ Lần vi phạm: <b>{violation_count}/{MAX_VIOLATIONS}</b>\n"
+        f"⏱ Mute: <b>{AUTO_MUTE_MINUTES} phút</b>\n\n"
+        "Admin có thể mở mute sớm bằng nút bên dưới."
+    )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Không gửi được thông báo mute cho nhóm."
+        )
+
+    # Đồng thời báo cho chủ bot
+    try:
+
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+
+    except Exception:
+
+        # Owner có thể chưa /start bot
+        logger.info(
+            "Không thể gửi thông báo mute riêng cho OWNER."
+        )
+
+
+# =========================================================
+# BAN USER
+# =========================================================
+
+async def ban_user(
+    context,
+    chat_id,
+    user_id
+):
+
+    try:
+
+        await context.bot.ban_chat_member(
+            chat_id=chat_id,
+            user_id=user_id
+        )
+
+        logger.info(
+            "Permanently banned user=%s chat=%s",
+            user_id,
+            chat_id
+        )
+
+        return True
+
+    except Exception:
+
+        logger.exception(
+            "Không thể ban user=%s",
+            user_id
+        )
+
+        return False
+
+
+# =========================================================
+# SEND ADMIN BAN NOTIFICATION
+# =========================================================
+
+async def send_ban_admin_notification(
+    context,
+    chat,
+    user,
+    violation_count
+):
+
+    username = (
+        f"@{user.username}"
+        if user.username
+        else "Không có username"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔓 MỞ BAN",
+                callback_data=(
+                    f"unban:{chat.id}:{user.id}"
+                )
+            ),
+            InlineKeyboardButton(
+                "❌ HUỶ",
+                callback_data=(
+                    f"cancelban:{chat.id}:{user.id}"
+                )
+            )
+        ]
+    ])
+
+    text = (
+        "🚫 <b>THÔNG BÁO BAN VĨNH VIỄN</b>\n\n"
+        f"👤 Người dùng: {user.mention_html()}\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"👤 Username: {html.escape(username)}\n"
+        f"🏷 Nhóm: <b>{html.escape(chat.title or 'Nhóm')}</b>\n"
+        f"⚠️ Lần vi phạm: <b>{violation_count}/{MAX_VIOLATIONS}</b>\n\n"
+        "🚫 Người dùng đã bị ban vĩnh viễn vì "
+        f"vi phạm đủ {MAX_VIOLATIONS} lần.\n\n"
+        "Admin có thể mở ban bằng nút bên dưới."
+    )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Không gửi được thông báo ban cho nhóm."
+        )
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+
+    except Exception:
+
+        logger.info(
+            "Không thể gửi thông báo ban riêng cho OWNER."
+        )
+
+
+# =========================================================
 # GROUP ACCESS
 # =========================================================
 
@@ -656,12 +1118,14 @@ async def check_group_access(
     chat = update.effective_chat
 
     if chat is None:
+
         return False
 
     if chat.type not in (
         "group",
         "supergroup"
     ):
+
         return True
 
     save_group(
@@ -701,33 +1165,43 @@ async def check_group_access(
             [
                 InlineKeyboardButton(
                     "✅ CẤP QUYỀN",
-                    callback_data=f"approve_{chat.id}"
+                    callback_data=(
+                        f"approve_{chat.id}"
+                    )
                 ),
                 InlineKeyboardButton(
                     "❌ TỪ CHỐI",
-                    callback_data=f"decline_{chat.id}"
+                    callback_data=(
+                        f"decline_{chat.id}"
+                    )
                 )
             ]
         ])
 
         try:
-            title_escaped = html.escape(chat.title or "Nhóm")
-            username_str = f"@{chat.username}" if chat.username else "Không có"
 
-            # Đổi sang parse_mode HTML để chống lỗi ký tự đặc biệt làm vỡ Markdown
+            title_escaped = html.escape(
+                chat.title or "Nhóm"
+            )
+
+            username_str = (
+                f"@{chat.username}"
+                if chat.username
+                else "Không có"
+            )
+
             await context.bot.send_message(
                 chat_id=OWNER_ID,
                 text=(
                     "📥 <b>YÊU CẦU CẤP QUYỀN NHÓM</b>\n\n"
                     f"🏷 Tên: {title_escaped}\n"
                     f"🆔 ID: <code>{chat.id}</code>\n"
-                    f"🔗 Username: {username_str}"
+                    f"🔗 Username: {html.escape(username_str)}"
                 ),
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
 
-            # Chỉ set đã thông báo khi gửi tin nhắn cho Owner thành công
             set_group_notified(
                 chat.id
             )
@@ -752,81 +1226,272 @@ async def button_callback(
 
     query = update.callback_query
 
-    await query.answer()
+    if query is None:
 
-    if query.from_user.id != OWNER_ID:
+        return
+
+    data = query.data or ""
+
+    # -----------------------------------------------------
+    # ACCESS REQUEST
+    # -----------------------------------------------------
+
+    if data.startswith(
+        "approve_"
+    ) or data.startswith(
+        "decline_"
+    ):
+
+        if query.from_user.id != OWNER_ID:
+
+            await query.answer(
+                "❌ Bạn không có quyền.",
+                show_alert=True
+            )
+
+            return
+
+        await query.answer()
+
+        try:
+
+            chat_id = int(
+                data.split("_", 1)[1]
+            )
+
+        except Exception:
+
+            return
+
+        if data.startswith(
+            "approve_"
+        ):
+
+            set_group_enabled(
+                chat_id,
+                True
+            )
+
+            try:
+
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "✅ Bot đã được admin cấp quyền "
+                        "và bắt đầu hoạt động."
+                    )
+                )
+
+            except Exception:
+
+                pass
+
+            await query.edit_message_text(
+                "✅ Đã CẤP QUYỀN nhóm."
+            )
+
+        else:
+
+            set_group_enabled(
+                chat_id,
+                False
+            )
+
+            try:
+
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "❌ Yêu cầu sử dụng bot đã bị từ chối."
+                    )
+                )
+
+            except Exception:
+
+                pass
+
+            await query.edit_message_text(
+                "❌ Đã TỪ CHỐI nhóm."
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # MODERATION CALLBACK
+    # -----------------------------------------------------
+
+    parts = data.split(":")
+
+    if len(parts) != 3:
 
         await query.answer(
-            "Bạn không có quyền.",
+            "❌ Nút không hợp lệ.",
             show_alert=True
         )
 
         return
 
-    data = query.data
+    action = parts[0]
 
-    if data.startswith(
-        "approve_"
-    ):
+    try:
 
         chat_id = int(
-            data.split("_", 1)[1]
+            parts[1]
         )
 
-        set_group_enabled(
-            chat_id,
-            True
+        user_id = int(
+            parts[2]
         )
+
+    except ValueError:
+
+        await query.answer(
+            "❌ Dữ liệu không hợp lệ.",
+            show_alert=True
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # CHECK ADMIN
+    # -----------------------------------------------------
+
+    allowed = await is_admin(
+        context,
+        chat_id,
+        query.from_user.id
+    )
+
+    if not allowed:
+
+        await query.answer(
+            "❌ Chỉ admin nhóm mới được sử dụng nút này.",
+            show_alert=True
+        )
+
+        return
+
+    await query.answer()
+
+    # -----------------------------------------------------
+    # UNMUTE
+    # -----------------------------------------------------
+
+    if action == "unmute":
 
         try:
 
-            await context.bot.send_message(
+            await context.bot.restrict_chat_member(
                 chat_id=chat_id,
-                text=(
-                    "✅ Bot đã được admin cấp quyền "
-                    "và bắt đầu hoạt động."
-                )
+                user_id=user_id,
+                permissions=normal_permissions()
+            )
+
+            delete_mute(
+                chat_id,
+                user_id
+            )
+
+            await query.edit_message_text(
+                f"🔓 Đã MỞ MUTE cho user "
+                f"<code>{user_id}</code>.",
+                parse_mode="HTML"
             )
 
         except Exception:
 
             logger.exception(
-                "Không thể báo nhóm đã cấp quyền."
+                "Callback unmute failed."
             )
 
-        await query.edit_message_text(
-            "✅ Đã CẤP QUYỀN nhóm."
-        )
+            await query.answer(
+                "❌ Không thể mở mute. Kiểm tra quyền bot.",
+                show_alert=True
+            )
 
-    elif data.startswith(
-        "decline_"
-    ):
+        return
 
-        chat_id = int(
-            data.split("_", 1)[1]
-        )
+    # -----------------------------------------------------
+    # CANCEL MUTE
+    # -----------------------------------------------------
 
-        set_group_enabled(
-            chat_id,
-            False
-        )
+    if action == "cancelmute":
 
         try:
 
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "❌ Yêu cầu sử dụng bot đã bị từ chối."
-                )
+            await query.edit_message_reply_markup(
+                reply_markup=None
+            )
+
+            await query.answer(
+                "Đã huỷ thao tác."
             )
 
         except Exception:
 
             pass
 
-        await query.edit_message_text(
-            "❌ Đã TỪ CHỐI nhóm."
-        )
+        return
+
+    # -----------------------------------------------------
+    # UNBAN
+    # -----------------------------------------------------
+
+    if action == "unban":
+
+        try:
+
+            await context.bot.unban_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                only_if_banned=True
+            )
+
+            await query.edit_message_text(
+                f"🔓 Đã MỞ BAN cho user "
+                f"<code>{user_id}</code>.",
+                parse_mode="HTML"
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Callback unban failed."
+            )
+
+            await query.answer(
+                "❌ Không thể mở ban. Kiểm tra quyền bot.",
+                show_alert=True
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # CANCEL BAN
+    # -----------------------------------------------------
+
+    if action == "cancelban":
+
+        try:
+
+            await query.edit_message_reply_markup(
+                reply_markup=None
+            )
+
+            await query.answer(
+                "Đã huỷ thao tác."
+            )
+
+        except Exception:
+
+            pass
+
+        return
+
+    await query.answer(
+        "❌ Không rõ thao tác.",
+        show_alert=True
+    )
 
 
 # =========================================================
@@ -853,11 +1518,9 @@ async def capquyen_command(
 
         return
 
-    group_value = context.args[0]
-
     chat = await resolve_group(
         context,
-        group_value
+        context.args[0]
     )
 
     if chat is None:
@@ -1006,8 +1669,6 @@ async def mute_command(
 
         return
 
-    group_value = context.args[1]
-
     duration = parse_duration(
         context.args[2]
     )
@@ -1016,7 +1677,6 @@ async def mute_command(
 
         await update.message.reply_text(
             "❌ Thời gian không hợp lệ.\n\n"
-            "Ví dụ:\n"
             "10p = 10 phút\n"
             "2h = 2 giờ\n"
             "1n = 1 ngày\n"
@@ -1027,7 +1687,7 @@ async def mute_command(
 
     chat = await resolve_group(
         context,
-        group_value
+        context.args[1]
     )
 
     if chat is None:
@@ -1073,11 +1733,10 @@ async def mute_command(
 
     if success:
 
-        title_escaped = html.escape(chat.title or "Nhóm")
         await update.message.reply_text(
             f"✅ Đã mute <code>{user_id}</code> "
-            f"trong nhóm <b>{title_escaped}</b> "
-            f"thời gian {context.args[2]}.",
+            f"trong <b>{html.escape(chat.title or 'Nhóm')}</b> "
+            f"thời gian {html.escape(context.args[2])}.",
             parse_mode="HTML"
         )
 
@@ -1150,10 +1809,9 @@ async def unmute_command(
             user_id
         )
 
-        title_escaped = html.escape(chat.title or "Nhóm")
         await update.message.reply_text(
             f"✅ Đã unmute <code>{user_id}</code> "
-            f"trong <b>{title_escaped}</b>.",
+            f"trong <b>{html.escape(chat.title or 'Nhóm')}</b>.",
             parse_mode="HTML"
         )
 
@@ -1166,6 +1824,129 @@ async def unmute_command(
         await update.message.reply_text(
             "❌ Không thể unmute."
         )
+
+
+# =========================================================
+# /VI PHẠM
+# =========================================================
+
+async def vipham_command(
+    update,
+    context
+):
+
+    if not is_owner(update):
+
+        return
+
+    if len(context.args) != 2:
+
+        await update.message.reply_text(
+            "Dùng:\n"
+            "/vipham USER_ID @GROUP"
+        )
+
+        return
+
+    try:
+
+        user_id = int(
+            context.args[0]
+        )
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ USER_ID không hợp lệ."
+        )
+
+        return
+
+    chat = await resolve_group(
+        context,
+        context.args[1]
+    )
+
+    if chat is None:
+
+        await update.message.reply_text(
+            "❌ Không tìm thấy nhóm."
+        )
+
+        return
+
+    count = get_violation_count(
+        chat.id,
+        user_id
+    )
+
+    await update.message.reply_text(
+        f"⚠️ User <code>{user_id}</code>\n"
+        f"🏷 Nhóm: <b>{html.escape(chat.title or 'Nhóm')}</b>\n"
+        f"📊 Vi phạm: <b>{count}/{MAX_VIOLATIONS}</b>",
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# /RESETVI PHẠM
+# =========================================================
+
+async def resetvipham_command(
+    update,
+    context
+):
+
+    if not is_owner(update):
+
+        return
+
+    if len(context.args) != 2:
+
+        await update.message.reply_text(
+            "Dùng:\n"
+            "/resetvipham USER_ID @GROUP"
+        )
+
+        return
+
+    try:
+
+        user_id = int(
+            context.args[0]
+        )
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ USER_ID không hợp lệ."
+        )
+
+        return
+
+    chat = await resolve_group(
+        context,
+        context.args[1]
+    )
+
+    if chat is None:
+
+        await update.message.reply_text(
+            "❌ Không tìm thấy nhóm."
+        )
+
+        return
+
+    reset_violations(
+        chat.id,
+        user_id
+    )
+
+    await update.message.reply_text(
+        f"✅ Đã reset số lần vi phạm của "
+        f"<code>{user_id}</code> về 0.",
+        parse_mode="HTML"
+    )
 
 
 # =========================================================
@@ -1193,45 +1974,18 @@ async def start_command(
 
     await update.message.reply_text(
         "🤖 NSFW MODERATION BOT\n\n"
-        "Bot tự động kiểm tra ảnh/sticker được gửi "
-        "trong nhóm.\n\n"
+        "Bot tự động kiểm tra ảnh/sticker.\n\n"
         "🔞 Phát hiện nội dung 18+\n"
-        "🗑 Tự động xoá tin nhắn\n"
-        f"🔇 Tự động mute {AUTO_MUTE_MINUTES} phút\n"
-        "👮 Bỏ qua admin\n\n"
-        "⚡ Không quét video."
+        "🗑 Tự động xoá\n"
+        f"🔇 Mute {AUTO_MUTE_MINUTES} phút\n"
+        f"⚠️ {MAX_VIOLATIONS} lần vi phạm = BAN VĨNH VIỄN\n"
+        "👮 Bỏ qua admin\n"
+        "🎥 Không quét video."
     )
 
 
 # =========================================================
-# CHECK ADMIN
-# =========================================================
-
-async def is_admin(
-    context,
-    chat_id,
-    user_id
-):
-
-    try:
-
-        member = await context.bot.get_chat_member(
-            chat_id,
-            user_id
-        )
-
-        return member.status in (
-            "administrator",
-            "creator"
-        )
-
-    except Exception:
-
-        return False
-
-
-# =========================================================
-# PROCESS PHOTO & STICKERS / ANIMATIONS
+# PROCESS MEDIA
 # =========================================================
 
 async def process_photo(
@@ -1254,33 +2008,9 @@ async def process_photo(
 
         return
 
-    target_file_id = None
-
-    if message.photo:
-        target_file_id = message.photo[-1].file_id
-    elif message.sticker:
-        if message.sticker.thumbnail:
-            target_file_id = message.sticker.thumbnail.file_id
-        else:
-            target_file_id = message.sticker.file_id
-    elif message.animation:
-        if message.animation.thumbnail:
-            target_file_id = message.animation.thumbnail.file_id
-    elif message.document:
-        if message.document.mime_type and message.document.mime_type.startswith("image/"):
-            target_file_id = message.document.file_id
-        elif message.document.thumbnail:
-            target_file_id = message.document.thumbnail.file_id
-
-    if not target_file_id:
-        return
-
-    logger.info(
-        "📷 Nhận file | chat=%s user=%s message=%s",
-        chat.id,
-        user.id if user else None,
-        message.message_id
-    )
+    # -----------------------------------------------------
+    # GROUP ACCESS
+    # -----------------------------------------------------
 
     allowed = await check_group_access(
         update,
@@ -1290,6 +2020,10 @@ async def process_photo(
     if not allowed:
 
         return
+
+    # -----------------------------------------------------
+    # IGNORE ADMIN
+    # -----------------------------------------------------
 
     if user:
 
@@ -1306,9 +2040,82 @@ async def process_photo(
 
             return
 
+    # -----------------------------------------------------
+    # GET FILE
+    # -----------------------------------------------------
+
+    target_file_id = None
+
+    if message.photo:
+
+        target_file_id = (
+            message.photo[-1].file_id
+        )
+
+    elif message.sticker:
+
+        # Sticker tĩnh thường có thumbnail
+        if message.sticker.thumbnail:
+
+            target_file_id = (
+                message.sticker.thumbnail.file_id
+            )
+
+        else:
+
+            target_file_id = (
+                message.sticker.file_id
+            )
+
+    elif message.animation:
+
+        # Không quét video.
+        # Animation GIF vẫn có thể lấy thumbnail
+        # nếu Telegram cung cấp.
+        if message.animation.thumbnail:
+
+            target_file_id = (
+                message.animation.thumbnail.file_id
+            )
+
+    elif message.document:
+
+        mime = (
+            message.document.mime_type or ""
+        )
+
+        if mime.startswith(
+            "image/"
+        ):
+
+            target_file_id = (
+                message.document.file_id
+            )
+
+        elif message.document.thumbnail:
+
+            target_file_id = (
+                message.document.thumbnail.file_id
+            )
+
+    if not target_file_id:
+
+        return
+
+    logger.info(
+        "📷 Nhận file | chat=%s user=%s message=%s",
+        chat.id,
+        user.id if user else None,
+        message.message_id
+    )
+
     temp_path = None
 
     try:
+
+        # -------------------------------------------------
+        # TEMP FILE
+        # -------------------------------------------------
 
         with tempfile.NamedTemporaryFile(
             suffix=".jpg",
@@ -1316,6 +2123,10 @@ async def process_photo(
         ) as temp_file:
 
             temp_path = temp_file.name
+
+        # -------------------------------------------------
+        # DOWNLOAD
+        # -------------------------------------------------
 
         logger.info(
             "⬇️ Download ảnh %s",
@@ -1329,6 +2140,10 @@ async def process_photo(
         await telegram_file.download_to_drive(
             temp_path
         )
+
+        # -------------------------------------------------
+        # AI SCAN
+        # -------------------------------------------------
 
         logger.info(
             "🔍 Đang quét ảnh %s",
@@ -1364,6 +2179,10 @@ async def process_photo(
 
             return
 
+        # -------------------------------------------------
+        # NSFW DETECTED
+        # -------------------------------------------------
+
         logger.warning(
             "🔞 PHÁT HIỆN NSFW | chat=%s user=%s "
             "message=%s score=%.3f",
@@ -1372,6 +2191,10 @@ async def process_photo(
             message.message_id,
             result["score"]
         )
+
+        # -------------------------------------------------
+        # DELETE MESSAGE
+        # -------------------------------------------------
 
         try:
 
@@ -1389,19 +2212,107 @@ async def process_photo(
                 message.message_id
             )
 
-        if user:
+        if not user:
 
-            duration = timedelta(
-                minutes=AUTO_MUTE_MINUTES
-            )
+            return
 
-            await mute_user(
+        # -------------------------------------------------
+        # ADD VIOLATION
+        # -------------------------------------------------
+
+        violation_count = add_violation(
+            chat.id,
+            user.id
+        )
+
+        logger.warning(
+            "⚠️ USER %s VIOLATION %s/%s",
+            user.id,
+            violation_count,
+            MAX_VIOLATIONS
+        )
+
+        # -------------------------------------------------
+        # THIRD VIOLATION = PERMANENT BAN
+        # -------------------------------------------------
+
+        if violation_count >= MAX_VIOLATIONS:
+
+            ban_success = await ban_user(
                 context,
                 chat.id,
-                user.id,
-                duration
+                user.id
             )
 
+            if ban_success:
+
+                # Thông báo user
+                try:
+
+                    await context.bot.send_message(
+                        chat_id=chat.id,
+                        text=(
+                            f"🚫 {user.mention_html()} "
+                            "đã bị <b>BAN VĨNH VIỄN</b> khỏi nhóm.\n\n"
+                            f"⚠️ Lý do: gửi nội dung 18+ "
+                            f"{MAX_VIOLATIONS} lần.\n\n"
+                            "📢 Admin đã nhận được thông báo."
+                        ),
+                        parse_mode="HTML"
+                    )
+
+                except Exception:
+
+                    logger.exception(
+                        "Không gửi được thông báo ban."
+                    )
+
+                # Thông báo admin + nút
+                await send_ban_admin_notification(
+                    context,
+                    chat,
+                    user,
+                    violation_count
+                )
+
+            else:
+
+                try:
+
+                    await context.bot.send_message(
+                        chat_id=chat.id,
+                        text=(
+                            f"⚠️ Không thể ban "
+                            f"{user.mention_html()}.\n"
+                            "Hãy kiểm tra bot có quyền ban thành viên."
+                        ),
+                        parse_mode="HTML"
+                    )
+
+                except Exception:
+
+                    pass
+
+            return
+
+        # -------------------------------------------------
+        # VIOLATION 1 / 2 = MUTE
+        # -------------------------------------------------
+
+        duration = timedelta(
+            minutes=AUTO_MUTE_MINUTES
+        )
+
+        mute_success = await mute_user(
+            context,
+            chat.id,
+            user.id,
+            duration
+        )
+
+        if mute_success:
+
+            # Cảnh báo trong nhóm
             if WARN_USER:
 
                 try:
@@ -1410,9 +2321,13 @@ async def process_photo(
                         chat_id=chat.id,
                         text=(
                             f"⚠️ {user.mention_html()} "
-                            "đã gửi nội dung không phù hợp.\n"
+                            "đã gửi nội dung không phù hợp.\n\n"
+                            f"📊 Vi phạm: "
+                            f"<b>{violation_count}/{MAX_VIOLATIONS}</b>\n"
                             f"🔇 Đã bị mute "
-                            f"{AUTO_MUTE_MINUTES} phút."
+                            f"<b>{AUTO_MUTE_MINUTES} phút</b>.\n\n"
+                            "🚨 "
+                            "Gửi quá 3 lần sẽ bị ban vĩnh viễn khỏi nhóm."
                         ),
                         parse_mode="HTML"
                     )
@@ -1422,6 +2337,34 @@ async def process_photo(
                     logger.exception(
                         "Không gửi được cảnh báo."
                     )
+
+            # Gửi admin
+            await send_mute_admin_notification(
+                context,
+                chat,
+                user,
+                violation_count
+            )
+
+        else:
+
+            try:
+
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=(
+                        f"⚠️ {user.mention_html()} "
+                        f"đã vi phạm lần "
+                        f"{violation_count}/{MAX_VIOLATIONS}, "
+                        "nhưng bot không thể mute.\n"
+                        "Kiểm tra quyền Restrict Members của bot."
+                    ),
+                    parse_mode="HTML"
+                )
+
+            except Exception:
+
+                pass
 
     except Exception:
 
@@ -1511,6 +2454,10 @@ def main():
         .build()
     )
 
+    # -----------------------------------------------------
+    # COMMANDS
+    # -----------------------------------------------------
+
     application.add_handler(
         CommandHandler(
             "start",
@@ -1547,14 +2494,42 @@ def main():
     )
 
     application.add_handler(
+        CommandHandler(
+            "vipham",
+            vipham_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "resetvipham",
+            resetvipham_command
+        )
+    )
+
+    # -----------------------------------------------------
+    # CALLBACK BUTTON
+    # -----------------------------------------------------
+
+    application.add_handler(
         CallbackQueryHandler(
             button_callback
         )
     )
 
+    # -----------------------------------------------------
+    # MEDIA FILTER
+    #
+    # QUAN TRỌNG:
+    # Không dùng filters.STICKER
+    #
+    # Python-telegram-bot mới:
+    # filters.Sticker.ALL
+    # -----------------------------------------------------
+
     media_filter = (
         filters.PHOTO
-        | filters.STICKER
+        | filters.Sticker.ALL
         | filters.ANIMATION
         | filters.Document.IMAGE
     )
@@ -1566,6 +2541,10 @@ def main():
         )
     )
 
+    # -----------------------------------------------------
+    # OTHER GROUP MESSAGES
+    # -----------------------------------------------------
+
     application.add_handler(
         MessageHandler(
             filters.ChatType.GROUPS
@@ -1574,6 +2553,10 @@ def main():
             handle_group_messages
         )
     )
+
+    # -----------------------------------------------------
+    # ERROR
+    # -----------------------------------------------------
 
     application.add_error_handler(
         error_handler
@@ -1594,6 +2577,11 @@ def main():
     )
 
     logger.info(
+        "⚠️ MAX violations: %s",
+        MAX_VIOLATIONS
+    )
+
+    logger.info(
         "🎥 Video scanning: DISABLED"
     )
 
@@ -1601,6 +2589,10 @@ def main():
         allowed_updates=Update.ALL_TYPES
     )
 
+
+# =========================================================
+# RUN
+# =========================================================
 
 if __name__ == "__main__":
 
