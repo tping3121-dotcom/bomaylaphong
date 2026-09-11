@@ -251,7 +251,6 @@ def get_group_info_sync(chat_id):
 # =========================================================
 
 def find_group_by_username_sync(username):
-    """Tìm nhóm trong DB theo username (không cần @)."""
     conn = get_db()
     try:
         username = username.lstrip("@").lower()
@@ -673,96 +672,66 @@ async def is_bot_admin(bot, chat_id):
         return False, None
 
 
-async def require_group_admin(update, context):
+# =========================================================
+# 👮 BỘ GIẢI MÃ TARGET CHAT DÙNG CHO CẢ NHÓM LẪN CHAT RIÊNG
+# =========================================================
+
+async def resolve_target_chat(update, context):
+    """
+    Xác định chat_id cần thao tác:
+    - Nếu ở trong nhóm: Trả về chính nhóm đó.
+    - Nếu ở chat riêng: Yêu cầu Admin phải nhập chat_id ở đầu tham số.
+    """
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
 
-    if not message or not chat:
-        return False
+    if not message or not chat or not user:
+        return None, False
 
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await message.reply_text("❌ Lệnh này chỉ dùng trong nhóm.")
-        return False
+    # 1. Trường hợp gửi trực tiếp trong nhóm
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        if message.sender_chat and message.sender_chat.id == chat.id:
+            return chat.id, True
 
-    if message.sender_chat and message.sender_chat.id == chat.id:
-        return True
-
-    if not user:
-        await message.reply_text("❌ Không xác định được người dùng.")
-        return False
-
-    if user.id == OWNER_ID:
-        return True
-
-    if await is_admin(context.bot, chat.id, user.id):
-        return True
-
-    bot_admin, _ = await is_bot_admin(context.bot, chat.id)
-
-    if not bot_admin:
-        await message.reply_text(
-            "⚠️ <b>BOT CHƯA LÀ ADMIN</b>\n\n"
-            "Hãy thêm bot làm quản trị viên trong nhóm rồi cấp:\n\n"
-            "🗑️ Xoá tin nhắn\n"
-            "🔇 Hạn chế thành viên\n"
-            "🔨 Cấm thành viên\n\n"
-            "Sau đó thử lại.",
-            parse_mode="HTML",
-        )
-        return False
-
-    await message.reply_text(
-        "❌ Chỉ quản trị viên nhóm mới dùng được lệnh này. 👮"
-    )
-    return False
-
-
-# =========================================================
-# 🔐 QUYỀN BOT
-# =========================================================
-
-async def botcheck(update, context):
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not await require_group_admin(update, context):
-        return
-
-    try:
-        me = await context.bot.get_me()
-        member = await context.bot.get_chat_member(chat.id, me.id)
-
-        if member.status not in (
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ):
-            await message.reply_text("❌ Bot chưa phải admin.")
-            return
-
-        delete_ok = getattr(member, "can_delete_messages", False)
-        restrict_ok = getattr(member, "can_restrict_members", False)
-
-        text = (
-            "🤖 <b>KIỂM TRA QUYỀN BOT</b>\n\n"
-            f"👮 Trạng thái: <b>{member.status}</b>\n\n"
-            f"🗑️ Xoá tin: {'✅' if delete_ok else '❌'}\n"
-            f"🔇 Mute/Bỏ mute: {'✅' if restrict_ok else '❌'}\n"
-            f"🔨 Ban/Unban: {'✅' if restrict_ok else '❌'}\n"
-        )
-
-        if not delete_ok or not restrict_ok:
-            text += "\n⚠️ Hãy cấp cho bot toàn bộ quyền quản trị cần thiết."
+        if user.id == OWNER_ID or await is_admin(context.bot, chat.id, user.id):
+            return chat.id, True
         else:
-            text += "\n🎉 Bot đã đủ quyền để hoạt động."
+            await message.reply_text("❌ Chỉ quản trị viên mới dùng được lệnh này. 👮")
+            return None, False
 
-        await message.reply_text(text, parse_mode="HTML")
+    # 2. Trường hợp gửi trong khung chat riêng với Bot (Private)
+    if chat.type == ChatType.PRIVATE:
+        if not context.args:
+            await message.reply_text(
+                "💡 <b>HƯỚNG DẪN DÙNG TRONG CHAT RIÊNG</b>\n\n"
+                "Khi dùng trong chat riêng với Bot, bạn vui lòng nhập thêm <b>Chat ID của nhóm</b> vào đầu lệnh:\n\n"
+                "• <code>/mute &lt;chat_id&gt; &lt;user_id/@username&gt; [phút]</code>\n"
+                "• <code>/unmute &lt;chat_id&gt; &lt;user_id/@username&gt;</code>\n"
+                "• <code>/vipham &lt;chat_id&gt; &lt;user_id/@username&gt;</code>\n"
+                "• <code>/resetvipham &lt;chat_id&gt; &lt;user_id/@username&gt;</code>\n\n"
+                "<i>Ví dụ:</i> <code>/mute -1002415030100 @username 10</code>",
+                parse_mode="HTML"
+            )
+            return None, False
 
-    except Exception as e:
-        await message.reply_text(
-            f"❌ Không kiểm tra được quyền bot.\n<code>{e}</code>",
-            parse_mode="HTML",
-        )
+        target_chat_arg = context.args[0]
+        if not re.fullmatch(r"-?\d+", target_chat_arg):
+            await message.reply_text("❌ Chat ID nhóm không hợp lệ (Chat ID là dãy số, thường bắt đầu bằng -100).")
+            return None, False
+
+        target_chat_id = int(target_chat_arg)
+
+        # Check xem user có phải Admin nhóm đó hoặc OWNER không
+        if user.id != OWNER_ID and not await is_admin(context.bot, target_chat_id, user.id):
+            await message.reply_text("❌ Bạn không phải là Admin của nhóm này.")
+            return None, False
+
+        # Loại bỏ chat_id khỏi args để các hàm resolve user tiếp theo không bị lệch tham số
+        context.args.pop(0)
+        return target_chat_id, True
+
+    return None, False
 
 
 # =========================================================
@@ -837,11 +806,14 @@ async def unban_user(bot, chat_id, user_id):
 # 👤 RESOLVE USER
 # =========================================================
 
-async def resolve_user(update, context):
+async def resolve_user(update, context, target_chat_id=None):
     message = update.effective_message
     chat = update.effective_chat
+    
+    # Nếu không truyền target_chat_id thì lấy chat_id hiện tại
+    chat_id = target_chat_id if target_chat_id else chat.id
 
-    if not message or not chat:
+    if not message:
         return None
 
     if message.reply_to_message and message.reply_to_message.from_user:
@@ -855,17 +827,17 @@ async def resolve_user(update, context):
     if re.fullmatch(r"-?\d+", text):
         try:
             user_id = int(text)
-            member = await context.bot.get_chat_member(chat.id, user_id)
+            member = await context.bot.get_chat_member(chat_id, user_id)
             return member.user
         except Exception:
             return None
 
     if text.startswith("@"):
-        user_id = await find_user_by_username(chat.id, text)
+        user_id = await find_user_by_username(chat_id, text)
         if not user_id:
             return None
         try:
-            member = await context.bot.get_chat_member(chat.id, user_id)
+            member = await context.bot.get_chat_member(chat_id, user_id)
             return member.user
         except Exception:
             return None
@@ -1215,13 +1187,9 @@ async def cap_command(update, context):
 
     arg = context.args[0].strip()
 
-    # =====================================================
-    # XÁC ĐỊNH CHAT_ID
-    # =====================================================
     target_chat_id = None
     target_info = None
 
-    # 1️⃣ Theo chat_id (số, có thể âm)
     if re.fullmatch(r"-?\d+", arg):
         try:
             target_chat_id = int(arg)
@@ -1230,13 +1198,11 @@ async def cap_command(update, context):
             await message.reply_text("❌ Chat ID không hợp lệ.")
             return
 
-    # 2️⃣ Theo username
     elif arg.startswith("@"):
         target_info = await find_group_by_username(arg)
         if target_info:
             target_chat_id = target_info["chat_id"]
         else:
-            # Thử resolve từ Telegram (nếu bot đã từng ở nhóm đó)
             try:
                 uname = arg.lstrip("@")
                 chat_obj = await context.bot.get_chat(f"@{uname}")
@@ -1247,7 +1213,6 @@ async def cap_command(update, context):
                     "username": chat_obj.username or "",
                     "enabled": 0,
                 }
-                # Lưu vào DB luôn
                 await request_group_access(
                     target_chat_id,
                     target_info["title"],
@@ -1276,9 +1241,6 @@ async def cap_command(update, context):
         await message.reply_text("❌ Không xác định được nhóm.")
         return
 
-    # =====================================================
-    # KIỂM TRA ĐÃ CẤP QUYỀN CHƯA
-    # =====================================================
     already = await group_enabled(target_chat_id)
     if already:
         await message.reply_text(
@@ -1289,9 +1251,6 @@ async def cap_command(update, context):
         )
         return
 
-    # =====================================================
-    # CẤP QUYỀN
-    # =====================================================
     await approve_group(target_chat_id)
 
     title = target_info.get("title") if target_info else None
@@ -1311,7 +1270,6 @@ async def cap_command(update, context):
 
     await message.reply_text(confirm_text, parse_mode="HTML")
 
-    # Gửi thông báo vào nhóm (nếu bot ở trong nhóm)
     try:
         await context.bot.send_message(
             chat_id=target_chat_id,
@@ -1396,7 +1354,6 @@ async def uncap_command(update, context):
         parse_mode="HTML",
     )
 
-    # Thông báo vào nhóm
     try:
         await context.bot.send_message(
             chat_id=target_chat_id,
@@ -1423,9 +1380,6 @@ async def callback_handler(update, context):
 
     data = query.data or ""
 
-    # =====================================================
-    # 📋 PENDING LIST
-    # =====================================================
     if data == "pending_list":
         if query.from_user.id != OWNER_ID:
             await query.answer("❌ Bạn không có quyền.", show_alert=True)
@@ -1486,9 +1440,6 @@ async def callback_handler(update, context):
         await query.answer()
         return
 
-    # =====================================================
-    # ✅ APPROVE
-    # =====================================================
     if data.startswith("approve:"):
         if query.from_user.id != OWNER_ID:
             await query.answer("❌ Bạn không có quyền.", show_alert=True)
@@ -1530,9 +1481,6 @@ async def callback_handler(update, context):
             pass
         return
 
-    # =====================================================
-    # ❌ DENY
-    # =====================================================
     if data.startswith("deny:"):
         if query.from_user.id != OWNER_ID:
             await query.answer("❌ Bạn không có quyền.", show_alert=True)
@@ -1570,9 +1518,6 @@ async def callback_handler(update, context):
             pass
         return
 
-    # =====================================================
-    # 🔊 UNMUTE
-    # =====================================================
     if data.startswith("unmute:"):
         parts = data.split(":")
         if len(parts) != 3:
@@ -1596,9 +1541,6 @@ async def callback_handler(update, context):
             await query.answer(f"❌ Lỗi: {e}", show_alert=True)
         return
 
-    # =====================================================
-    # ❌ CANCEL MUTE
-    # =====================================================
     if data.startswith("cancelmute:"):
         parts = data.split(":")
         if len(parts) != 3:
@@ -1618,9 +1560,6 @@ async def callback_handler(update, context):
             pass
         return
 
-    # =====================================================
-    # 🔓 UNBAN
-    # =====================================================
     if data.startswith("unban:"):
         parts = data.split(":")
         if len(parts) != 3:
@@ -1644,9 +1583,6 @@ async def callback_handler(update, context):
             await query.answer(f"❌ Lỗi: {e}", show_alert=True)
         return
 
-    # =====================================================
-    # ❌ CANCEL BAN
-    # =====================================================
     if data.startswith("cancelban:"):
         parts = data.split(":")
         if len(parts) != 3:
@@ -1884,31 +1820,30 @@ async def process_photo(update, context):
 # =========================================================
 
 async def vipham(update, context):
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not await require_group_admin(update, context):
+    target_chat_id, ok = await resolve_target_chat(update, context)
+    if not ok:
         return
 
-    target = await resolve_user(update, context)
+    target = await resolve_user(update, context, target_chat_id)
 
     if not target:
-        await message.reply_text(
+        await update.effective_message.reply_text(
             "⚠️ Không tìm thấy người dùng.\n\n"
             "💡 Cách dùng:\n"
-            "• Reply vào tin nhắn người đó + /vipham\n"
-            "• /vipham ID\n"
-            "• /vipham @username\n\n"
-            "📌 Với @username, bot phải từng nhìn thấy người đó."
+            "• Reply vào tin nhắn + /vipham\n"
+            "• Trong nhóm: <code>/vipham ID/@username</code>\n"
+            "• Chat riêng: <code>/vipham &lt;chat_id&gt; ID/@username</code>",
+            parse_mode="HTML"
         )
         return
 
-    count = await get_violation_count(chat.id, target.id)
+    count = await get_violation_count(target_chat_id, target.id)
 
-    await message.reply_text(
+    await update.effective_message.reply_text(
         "👤 <b>THÔNG TIN VI PHẠM</b>\n\n"
-        f"👤 {target.mention_html()}\n"
-        f"🆔 <code>{target.id}</code>\n"
+        f"📌 Nhóm ID: <code>{target_chat_id}</code>\n"
+        f"👤 Thành viên: {target.mention_html()}\n"
+        f"🆔 ID: <code>{target.id}</code>\n"
         f"⚠️ Vi phạm: <b>{count}</b>\n"
         f"📊 Giới hạn: <b>{MAX_VIOLATIONS}</b>",
         parse_mode="HTML",
@@ -1920,27 +1855,27 @@ async def vipham(update, context):
 # =========================================================
 
 async def resetvipham(update, context):
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not await require_group_admin(update, context):
+    target_chat_id, ok = await resolve_target_chat(update, context)
+    if not ok:
         return
 
-    target = await resolve_user(update, context)
+    target = await resolve_user(update, context, target_chat_id)
 
     if not target:
-        await message.reply_text(
+        await update.effective_message.reply_text(
             "⚠️ Hãy reply tin nhắn người cần reset hoặc dùng:\n\n"
-            "/resetvipham ID\n"
-            "/resetvipham @username"
+            "• Trong nhóm: <code>/resetvipham ID/@username</code>\n"
+            "• Chat riêng: <code>/resetvipham &lt;chat_id&gt; ID/@username</code>",
+            parse_mode="HTML"
         )
         return
 
-    await reset_violation(chat.id, target.id)
+    await reset_violation(target_chat_id, target.id)
 
-    await message.reply_text(
+    await update.effective_message.reply_text(
         "🔄 <b>ĐÃ RESET VI PHẠM</b>\n\n"
-        f"👤 {target.mention_html()}\n"
+        f"📌 Nhóm ID: <code>{target_chat_id}</code>\n"
+        f"👤 Thành viên: {target.mention_html()}\n"
         "⚠️ Số lần vi phạm: <b>0</b>",
         parse_mode="HTML",
     )
@@ -1951,21 +1886,19 @@ async def resetvipham(update, context):
 # =========================================================
 
 async def mute_command(update, context):
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not await require_group_admin(update, context):
+    target_chat_id, ok = await resolve_target_chat(update, context)
+    if not ok:
         return
 
-    target = await resolve_user(update, context)
+    target = await resolve_user(update, context, target_chat_id)
 
     if not target:
-        await message.reply_text(
+        await update.effective_message.reply_text(
             "⚠️ Hãy reply người cần mute hoặc dùng:\n\n"
-            "/mute ID\n"
-            "/mute @username\n"
-            "/mute ID 10\n\n"
-            "⏱️ Mặc định: 2 phút."
+            "• Trong nhóm: <code>/mute ID/@username [phút]</code>\n"
+            "• Chat riêng: <code>/mute &lt;chat_id&gt; ID/@username [phút]</code>\n\n"
+            "⏱️ Mặc định: 2 phút.",
+            parse_mode="HTML"
         )
         return
 
@@ -1978,15 +1911,16 @@ async def mute_command(update, context):
             pass
 
     try:
-        await mute_user(context.bot, chat.id, target.id, minutes)
-        await message.reply_text(
+        await mute_user(context.bot, target_chat_id, target.id, minutes)
+        await update.effective_message.reply_text(
             "🔇 <b>ĐÃ MUTE</b>\n\n"
-            f"👤 {target.mention_html()}\n"
+            f"📌 Nhóm ID: <code>{target_chat_id}</code>\n"
+            f"👤 Thành viên: {target.mention_html()}\n"
             f"⏱️ Thời gian: <b>{minutes} phút</b>",
             parse_mode="HTML",
         )
     except Exception as e:
-        await message.reply_text(
+        await update.effective_message.reply_text(
             f"❌ <b>Không thể mute.</b>\n\n<code>{e}</code>\n\n"
             "⚠️ Hãy kiểm tra quyền Restrict Members của bot.",
             parse_mode="HTML",
@@ -1998,33 +1932,106 @@ async def mute_command(update, context):
 # =========================================================
 
 async def unmute_command(update, context):
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not await require_group_admin(update, context):
+    target_chat_id, ok = await resolve_target_chat(update, context)
+    if not ok:
         return
 
-    target = await resolve_user(update, context)
+    target = await resolve_user(update, context, target_chat_id)
 
     if not target:
-        await message.reply_text(
+        await update.effective_message.reply_text(
             "⚠️ Hãy reply người cần unmute hoặc dùng:\n\n"
-            "/unmute ID\n"
-            "/unmute @username"
+            "• Trong nhóm: <code>/unmute ID/@username</code>\n"
+            "• Chat riêng: <code>/unmute &lt;chat_id&gt; ID/@username</code>",
+            parse_mode="HTML"
         )
         return
 
     try:
-        await unmute_user(context.bot, chat.id, target.id)
-        await message.reply_text(
-            f"🔊 <b>ĐÃ BỎ MUTE</b>\n\n👤 {target.mention_html()}",
+        await unmute_user(context.bot, target_chat_id, target.id)
+        await update.effective_message.reply_text(
+            "🔊 <b>ĐÃ BỎ MUTE</b>\n\n"
+            f"📌 Nhóm ID: <code>{target_chat_id}</code>\n"
+            f"👤 Thành viên: {target.mention_html()}",
             parse_mode="HTML",
         )
     except Exception as e:
-        await message.reply_text(
+        await update.effective_message.reply_text(
             f"❌ <b>Không thể unmute.</b>\n\n<code>{e}</code>",
             parse_mode="HTML",
         )
+
+
+# =========================================================
+# 🔐 /BOTCHECK
+# =========================================================
+
+async def botcheck(update, context):
+    target_chat_id, ok = await resolve_target_chat(update, context)
+    if not ok:
+        return
+
+    try:
+        me = await context.bot.get_me()
+        member = await context.bot.get_chat_member(target_chat_id, me.id)
+
+        if member.status not in (
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ):
+            await update.effective_message.reply_text("❌ Bot chưa phải admin trong nhóm này.")
+            return
+
+        delete_ok = getattr(member, "can_delete_messages", False)
+        restrict_ok = getattr(member, "can_restrict_members", False)
+
+        text = (
+            "🤖 <b>KIỂM TRA QUYỀN BOT</b>\n\n"
+            f"📌 Nhóm ID: <code>{target_chat_id}</code>\n"
+            f"👮 Trạng thái: <b>{member.status}</b>\n\n"
+            f"🗑️ Xoá tin: {'✅' if delete_ok else '❌'}\n"
+            f"🔇 Mute/Bỏ mute: {'✅' if restrict_ok else '❌'}\n"
+            f"🔨 Ban/Unban: {'✅' if restrict_ok else '❌'}\n"
+        )
+
+        if not delete_ok or not restrict_ok:
+            text += "\n⚠️ Hãy cấp cho bot toàn bộ quyền quản trị cần thiết."
+        else:
+            text += "\n🎉 Bot đã đủ quyền để hoạt động."
+
+        await update.effective_message.reply_text(text, parse_mode="HTML")
+
+    except Exception as e:
+        await update.effective_message.reply_text(
+            f"❌ Không kiểm tra được quyền bot.\n<code>{e}</code>",
+            parse_mode="HTML",
+        )
+
+
+# =========================================================
+# ℹ️ /TRANGTHAI
+# =========================================================
+
+async def trangthai(update, context):
+    target_chat_id, ok = await resolve_target_chat(update, context)
+    if not ok:
+        return
+
+    enabled = await group_enabled(target_chat_id)
+    status = "🟢 ĐANG HOẠT ĐỘNG" if enabled else "🔴 CHƯA ĐƯỢC CẤP QUYỀN"
+
+    await update.effective_message.reply_text(
+        "🛡️ <b>TRẠNG THÁI BOT</b>\n\n"
+        f"📌 Nhóm ID: <code>{target_chat_id}</code>\n"
+        f"🔐 Cấp quyền: <b>{status}</b>\n\n"
+        "🖼️ Ảnh: ✅\n"
+        "🎨 Sticker: ✅\n"
+        "🎬 Video: ❌ Không quét\n"
+        "🔞 NSFW: ✅\n"
+        "🔇 Mute: 2 phút\n"
+        "🔨 Lần 3: Ban",
+        parse_mode="HTML",
+    )
 
 
 # =========================================================
@@ -2075,35 +2082,6 @@ async def tb_command(update, context):
         "📊 <b>KẾT QUẢ GỬI THÔNG BÁO</b>\n\n"
         f"✅ Thành công: <b>{success}</b>\n"
         f"❌ Thất bại: <b>{failed}</b>",
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# ℹ️ /TRANGTHAI
-# =========================================================
-
-async def trangthai(update, context):
-    message = update.effective_message
-    chat = update.effective_chat
-
-    if not await require_group_admin(update, context):
-        return
-
-    enabled = await group_enabled(chat.id)
-
-    status = "🟢 ĐANG HOẠT ĐỘNG" if enabled else "🔴 CHƯA ĐƯỢC CẤP QUYỀN"
-
-    await message.reply_text(
-        "🛡️ <b>TRẠNG THÁI BOT</b>\n\n"
-        f"📌 Nhóm: <b>{chat.title}</b>\n"
-        f"🔐 Cấp quyền: <b>{status}</b>\n\n"
-        "🖼️ Ảnh: ✅\n"
-        "🎨 Sticker: ✅\n"
-        "🎬 Video: ❌ Không quét\n"
-        "🔞 NSFW: ✅\n"
-        "🔇 Mute: 2 phút\n"
-        "🔨 Lần 3: Ban",
         parse_mode="HTML",
     )
 
@@ -2249,9 +2227,9 @@ def main():
     # COMMANDS
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("capquyen", capquyen))
-    application.add_handler(CommandHandler("cap", cap_command))       # 🆕
-    application.add_handler(CommandHandler("grant", cap_command))     # 🆕 alias
-    application.add_handler(CommandHandler("uncap", uncap_command))   # 🆕
+    application.add_handler(CommandHandler("cap", cap_command))
+    application.add_handler(CommandHandler("grant", cap_command))
+    application.add_handler(CommandHandler("uncap", uncap_command))
     application.add_handler(CommandHandler("botcheck", botcheck))
     application.add_handler(CommandHandler("trangthai", trangthai))
     application.add_handler(CommandHandler("tb", tb_command))
