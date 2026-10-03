@@ -3,7 +3,7 @@ import logging
 import os
 import psycopg2
 from dotenv import load_dotenv
-from telethon import Button, TelegramClient, events
+from telethon import TelegramClient, events
 
 # =====================================================
 # 1. CẤU HÌNH
@@ -29,6 +29,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Khởi tạo Telethon Client (dùng session riêng cho tài khoản cá nhân)
+try:
+    API_ID = int(API_ID) if API_ID else None
+except ValueError:
+    API_ID = None
+
 client = TelegramClient('userbot_session', API_ID, API_HASH)
 
 # Biến toàn cục quản lý tiến trình gửi định kỳ
@@ -141,7 +146,6 @@ async def periodic_broadcast():
 
             for group_id in groups:
                 try:
-                    # Gửi tin nhắn bằng chính tài khoản cá nhân của bạn
                     await client.send_message(group_id, message_text)
                     logger.info(f"Đã tự động gửi tin nhắn đến nhóm {group_id}")
                 except Exception as e:
@@ -150,7 +154,7 @@ async def periodic_broadcast():
         logger.info("Tiến trình định kỳ đã bị dừng.")
 
 # =====================================================
-# 4. CÁC LỆNH ĐIỀU KHIỂN (Nhắn qua Saved Messages hoặc chat riêng với tài khoản)
+# 4. CÁC LỆNH ĐIỀU KHIỂN
 # =====================================================
 @client.on(events.NewMessage(pattern='/start'))
 async def start(event):
@@ -158,12 +162,12 @@ async def start(event):
         return
     await event.respond(
         "🤖 **USERBOT QUẢN LÝ THÔNG BÁO ĐANG CHẠY!**\n\n"
-        "• `/addid [id_nhóm]` - Thêm nhóm\n"
-        "• `/lsid` - Xem danh sách nhóm\n"
-        "• `/themnd [nội dung]` - Cài đặt nội dung\n"
+        "• `/nhom @username` - Thêm nhóm bằng username\n"
+        "• `/lsid` - Xem danh sách nhóm đã thêm\n"
+        "• `/themnd [nội dung]` - Cài đặt nội dung thông báo\n"
         "• `/nd` - Xem nội dung hiện tại\n"
-        "• `/xoand` - Xóa nội dung\n"
-        "• `/tb` - Bắt đầu tự động gửi (2 phút/lần)\n"
+        "• `/xnd` - Xóa nội dung thông báo\n"
+        "• `/batdau` - Bắt đầu tự động gửi (2 phút/lần)\n"
         "• `/stoptb` - Dừng tự động gửi",
         parse_mode='md'
     )
@@ -189,29 +193,34 @@ async def nd_command(event):
         return
     await event.respond(f"📋 **Nội dung hiện tại:**\n\n{content}", parse_mode='md')
 
-@client.on(events.NewMessage(pattern='/xoand'))
-async def xoand_command(event):
+@client.on(events.NewMessage(pattern='/xnd'))
+async def xnd_command(event):
     if not is_admin(event.sender_id):
         return
     delete_db_content()
     await event.respond("🗑️ Đã xóa nội dung thông báo thành công!")
 
-@client.on(events.NewMessage(pattern='/addid'))
-async def addid_command(event):
+@client.on(events.NewMessage(pattern='/nhom'))
+async def nhom_command(event):
     if not is_admin(event.sender_id):
         return
     parts = event.raw_text.split()
     if len(parts) < 2:
-        await event.respond("⚠️️ Sử dụng: `/addid [ID_nhóm]`", parse_mode='md')
+        await event.respond("⚠️ Sử dụng: `/nhom @username_nhom`", parse_mode='md')
         return
+    
+    group_username = parts[1]
     try:
-        group_id = int(parts[1])
+        # Lấy thông tin nhóm/channel dựa vào username mà tài khoản đã tham gia
+        entity = await client.get_entity(group_username)
+        group_id = entity.id
+        
+        # Nếu ID trả về dạng chuẩn (Telethon đôi khi trả về dạng âm cho nhóm, ta ép kiểu)
         save_group(group_id)
-        chat = await client.get_entity(group_id)
-        title = getattr(chat, 'title', 'Không có tên')
+        title = getattr(entity, 'title', 'Không có tên')
         await event.respond(f"✅ **Đã thêm nhóm thành công!**\n• Tên: {title}\n• ID: `{group_id}`", parse_mode='md')
     except Exception as e:
-        await event.respond(f"❌ Lỗi thêm nhóm: {e}")
+        await event.respond(f"❌ Không tìm thấy nhóm hoặc tài khoản chưa tham gia nhóm này: {e}")
 
 @client.on(events.NewMessage(pattern='/lsid'))
 async def lsid_command(event):
@@ -231,8 +240,8 @@ async def lsid_command(event):
             text += f"• (`{gid}`)\n"
     await event.respond(text, parse_mode='md')
 
-@client.on(events.NewMessage(pattern='/tb'))
-async def tb_command(event):
+@client.on(events.NewMessage(pattern='/batdau'))
+async def batdau_command(event):
     global broadcast_task
     if not is_admin(event.sender_id):
         return
@@ -250,7 +259,6 @@ async def tb_command(event):
         await event.respond("⚠️ Tiến trình tự động gửi đang chạy rồi.")
         return
 
-    # Gửi ngay lập tức lần đầu tiên bằng tài khoản của bạn
     success = 0
     for gid in groups:
         try:
@@ -259,7 +267,6 @@ async def tb_command(event):
         except Exception as e:
             logger.error(f"Lỗi gửi ngay tới {gid}: {e}")
 
-    # Bắt đầu chạy vòng lặp nền
     broadcast_task = asyncio.create_task(periodic_broadcast())
     await event.respond(f"📢 **Đã bắt đầu tự động gửi tin bằng tài khoản của bạn!**\n- Thành công gửi ngay: {success} nhóm\n- Chu kỳ: 2 phút/lần", parse_mode='md')
 
@@ -285,7 +292,6 @@ def main():
     init_db()
     
     print("UserBot đang khởi động và kết nối Telegram...")
-    # Khi chạy lệnh này lần đầu tiên, Telethon sẽ yêu cầu bạn nhập SĐT và mã OTP trực tiếp tại Terminal VPS
     client.start()
     print("UserBot đã đăng nhập thành công bằng tài khoản cá nhân!")
     
