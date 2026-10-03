@@ -2,9 +2,10 @@ import logging
 import os
 import psycopg2
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -97,28 +98,114 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "🤖 **Bot Thông Báo Định Kỳ đang hoạt động!**\n\n"
-        "• Dùng lệnh: `/tb [nội dung]` để bắt đầu gửi thông báo lên toàn bộ các nhóm (2 phút/lần).\n"
-        "• Dùng lệnh: `/stoptb` để dừng quá trình gửi thông báo.",
+        "• `/addid [id_nhóm]` - Thêm nhóm bằng ID (có nút xác nhận)\n"
+        "• `/lsid` - Xem danh sách ID nhóm đã thêm\n"
+        "• `/tb [nội dung]` - Phát thông báo định kỳ (2 phút/lần)\n"
+        "• `/stoptb` - Dừng quá trình phát thông báo",
         parse_mode="Markdown"
     )
 
-# Hàm tự động ghi nhận khi bot được thêm vào nhóm hoặc có tin nhắn trong nhóm
-async def track_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    if chat and chat.type in ["group", "supergroup"]:
+# Lệnh /addid: Kiểm tra thông tin nhóm và hiển thị nút xác nhận
+async def addid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Bạn không có quyền sử dụng lệnh này.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ Sử dụng: `/addid [ID_nhóm]`", parse_mode="Markdown")
+        return
+
+    try:
+        group_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID nhóm phải là một số nguyên.")
+        return
+
+    try:
+        chat = await context.bot.get_chat(group_id)
+        chat_title = chat.title or "Không có tên"
+        chat_username = f"@{chat.username}" if chat.username else "Không có username (@)"
+        
+        # Tạo nút xác nhận
+        keyboard = [[InlineKeyboardButton("✅ Xác nhận thêm nhóm", callback_data=f"confirm_add_{group_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            f"📋 **Thông tin nhóm tìm thấy:**\n\n"
+            f"• **Tên nhóm:** {chat_title}\n"
+            f"• **Username:** {chat_username}\n"
+            f"• **ID nhóm:** `{group_id}`\n\n"
+            f"Bạn có chắc chắn muốn thêm nhóm này vào danh sách nhận thông báo không?",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Không thể lấy thông tin nhóm. Hãy chắc chắn bot đã được thêm vào nhóm này.\nLỗi: {e}")
+
+# Xử lý nút bấm xác nhận thêm nhóm
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("Bạn không có quyền thao tác.")
+        return
+
+    data = query.data
+    if data.startswith("confirm_add_"):
+        group_id = int(data.split("_")[2])
+
         conn = get_db_connection()
         cur = conn.cursor()
         try:
             cur.execute(
                 "INSERT INTO bot_groups (group_id) VALUES (%s) ON CONFLICT (group_id) DO NOTHING;", 
-                (chat.id,)
+                (group_id,)
             )
             conn.commit()
+            
+            # Lấy thông tin cập nhật lại giao diện nút
+            chat = await context.bot.get_chat(group_id)
+            chat_title = chat.title or "Không có tên"
+            chat_username = f"@{chat.username}" if chat.username else "Không có"
+
+            await query.edit_message_text(
+                f"✅ **Đã thêm thành công nhóm vào cơ sở dữ liệu!**\n\n"
+                f"• **Tên nhóm:** {chat_title}\n"
+                f"• **Username:** {chat_username}\n"
+                f"• **ID nhóm:** `{group_id}`",
+                parse_mode="Markdown"
+            )
         except Exception as e:
-            logging.error(f"Lỗi khi lưu nhóm {chat.id}: {e}")
+            await query.edit_message_text(f"❌ Lỗi khi lưu nhóm vào database: {e}")
         finally:
             cur.close()
             conn.close()
+
+# Lệnh /lsid: Kiểm tra danh sách ID nhóm đã thêm kèm full thông tin
+async def lsid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("Bạn không có quyền sử dụng lệnh này.")
+        return
+
+    groups = get_bot_groups()
+    if not groups:
+        await update.message.reply_text("📋 Danh sách ID nhóm hiện tại: Trống.")
+        return
+
+    text = "📋 **Danh sách các nhóm đã thêm vào hệ thống:**\n\n"
+    for group_id in groups:
+        try:
+            chat = await context.bot.get_chat(group_id)
+            chat_title = chat.title or "Không có tên"
+            chat_username = f"@{chat.username}" if chat.username else "Không có"
+            text += f"• **Tên:** {chat_title}\n  **Username:** {chat_username}\n  **ID:** `{group_id}`\n\n"
+        except Exception:
+            text += f"• **Tên:** Không thể lấy thông tin (Bot có thể đã bị kick)\n  **ID:** `{group_id}`\n\n"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 # Lệnh /tb: Bắt đầu phát thông báo định kỳ mỗi 2 phút đến các nhóm
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,7 +221,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     groups = get_bot_groups()
     if not groups:
-        await update.message.reply_text("❌ Hiện tại bot chưa có trong nhóm nào cả. Hãy thêm bot vào các nhóm trước.")
+        await update.message.reply_text("❌ Hiện tại bot chưa có nhóm nào trong danh sách. Hãy dùng `/addid` để thêm.")
         return
 
     current_jobs = context.job_queue.get_jobs_by_name("broadcast_job")
@@ -142,7 +229,6 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Đang có một tiến trình thông báo chạy rồi. Hãy dùng `/stoptb` trước nếu muốn thay đổi nội dung!")
         return
 
-    # Chạy lặp lại mỗi 120 giây (2 phút), gửi ngay lập tức ở lần đầu tiên (first=0)
     context.job_queue.run_repeating(
         alarm_broadcast_callback,
         interval=120,
@@ -183,12 +269,11 @@ def main():
 
     # Đăng ký các Handler
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("addid", addid_command))
+    app.add_handler(CommandHandler("lsid", lsid_command))
     app.add_handler(CommandHandler("tb", broadcast_command))
     app.add_handler(CommandHandler("stoptb", stop_broadcast_command))
-    
-    # Tự động lưu nhóm khi có tin nhắn hoặc bot được thêm vào nhóm mới
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_groups))
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, track_groups))
+    app.add_handler(CallbackQueryHandler(button_handler))
 
     print("Bot thông báo định kỳ đang chạy...")
     app.run_polling()
