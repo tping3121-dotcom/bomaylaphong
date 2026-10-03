@@ -128,7 +128,7 @@ async def alarm_spam_callback(context: ContextTypes.DEFAULT_TYPE):
     
     logging.info(f"Đã chạy vòng lặp spam nhóm: Gửi thành công đến {success_count}/{len(spam_groups)} nhóm.")
 
-# Hàm chạy định kỳ gửi thông báo (/tb) đến toàn bộ người dùng và nhóm mỗi 2 phút (120 giây)
+# Hàm chạy định kỳ gửi thông báo định kỳ đến toàn bộ người dùng và nhóm mỗi 2 phút (120 giây)
 async def alarm_broadcast_callback(context: ContextTypes.DEFAULT_TYPE):
     message_text = context.job.data
     groups = get_spam_groups()
@@ -273,10 +273,59 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.close()
         conn.close()
 
-# Lệnh /tb: Bắt đầu gửi thông báo lặp lại mỗi 2 phút đến tất cả user và nhóm
+# Lệnh /thongbao (hoặc /tb): Gửi thông báo ngay lập tức 1 lần tới toàn bộ user và nhóm
+async def thongbao_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    # Tự động lưu admin vào danh sách user
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO spam_users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;", (user.id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text("Sử dụng: /thongbao [Nội dung thông báo bạn muốn gửi ngay]")
+        return
+
+    groups = get_spam_groups()
+    users = get_spam_users()
+
+    success_groups = 0
+    success_users = 0
+
+    await update.message.reply_text("⏳ Đang tiến hành gửi thông báo đến toàn bộ người dùng và nhóm...")
+
+    # Gửi đến các nhóm
+    for group_id in groups:
+        try:
+            await context.bot.send_message(chat_id=group_id, text=text)
+            success_groups += 1
+        except Exception as e:
+            logging.error(f"Lỗi gửi thông báo trực tiếp đến nhóm {group_id}: {e}")
+
+    # Gửi đến cá nhân người dùng
+    for user_id in users:
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text)
+            success_users += 1
+        except Exception as e:
+            logging.error(f"Lỗi gửi thông báo trực tiếp đến người dùng {user_id}: {e}")
+
+    await update.message.reply_text(
+        f"✅ **Đã gửi thông báo thành công!**\n\n"
+        f"👥 Đến nhóm: `{success_groups}` nhóm\n"
+        f"👤 Đến cá nhân: `{success_users}` người dùng",
+        parse_mode="Markdown"
+    )
+
+# Lệnh /tb (Lệnh cũ dùng để phát thông báo lặp lại định kỳ mỗi 2 phút)
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # Tự động lưu admin vào danh sách user luôn để đảm bảo nhận được tin nhắn
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("INSERT INTO spam_users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;", (user.id,))
@@ -294,7 +343,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     current_jobs = context.job_queue.get_jobs_by_name("broadcast_job")
     if current_jobs:
-        await update.message.reply_text("⚠️ Đang có một tiến trình thông báo (/tb) chạy rồi. Hãy dùng /stoptb trước nếu muốn thay đổi!")
+        await update.message.reply_text("⚠️ Đang có một tiến trình thông báo định kỳ chạy rồi. Hãy dùng /stoptb trước nếu muốn thay đổi!")
         return
 
     context.job_queue.run_repeating(
@@ -314,7 +363,7 @@ async def stop_broadcast_command(update: Update, context: ContextTypes.DEFAULT_T
 
     current_jobs = context.job_queue.get_jobs_by_name("broadcast_job")
     if not current_jobs:
-        await update.message.reply_text("⚠ Hiện không có tiến trình thông báo (/tb) nào đang chạy.")
+        await update.message.reply_text("⚠ Hiện không có tiến trình thông báo định kỳ nào đang chạy.")
         return
 
     for job in current_jobs:
@@ -334,6 +383,7 @@ async def set_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db_connection()
     cur = conn.cursor()
+    cur.execute("UPDATE spam_settings SET content = %s WHERE id = 1;", (text,))
     conn.commit()
     cur.close()
     conn.close()
@@ -366,6 +416,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("nd", set_content))
     app.add_handler(CommandHandler("xoand", clear_content))
+    app.add_handler(CommandHandler("thongbao", thongbao_command))
     app.add_handler(CommandHandler("tb", broadcast_command))
     app.add_handler(CommandHandler("stoptb", stop_broadcast_command))
     
