@@ -1,38 +1,41 @@
+import asyncio
 import logging
 import os
 import psycopg2
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
-from telegram.ext import (
-    ApplicationBuilder,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-)
+from telethon import Button, TelegramClient, events
+
 # =====================================================
 # 1. CẤU HÌNH
 # =====================================================
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = os.getenv("API_ID")
+API_HASH = os.getenv("API_HASH")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = os.getenv("DB_PORT", "5432")
+
 try:
     ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 except ValueError:
     ADMIN_ID = 0
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-JOB_NAME = "broadcast_job"
-BROADCAST_INTERVAL = 120
+
+# Khởi tạo Telethon Client (dùng session riêng cho tài khoản cá nhân)
+client = TelegramClient('userbot_session', API_ID, API_HASH)
+
+# Biến toàn cục quản lý tiến trình gửi định kỳ
+broadcast_task = None
+
 # =====================================================
-# 2. KẾT NỐI DATABASE
+# 2. KẾT NỐI DATABASE & KHỞI TẠO BẢNG
 # =====================================================
 def get_db_connection():
     return psycopg2.connect(
@@ -43,6 +46,7 @@ def get_db_connection():
         port=DB_PORT,
         connect_timeout=10,
     )
+
 def init_db():
     conn = get_db_connection()
     try:
@@ -52,10 +56,17 @@ def init_db():
                     group_id BIGINT PRIMARY KEY
                 );
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_content (
+                    id INT PRIMARY KEY,
+                    content TEXT
+                );
+            """)
         conn.commit()
         logger.info("Database đã sẵn sàng.")
     finally:
         conn.close()
+
 def get_bot_groups():
     conn = get_db_connection()
     try:
@@ -65,6 +76,7 @@ def get_bot_groups():
         return {row[0] for row in rows}
     finally:
         conn.close()
+
 def save_group(group_id: int):
     conn = get_db_connection()
     try:
@@ -80,410 +92,204 @@ def save_group(group_id: int):
         conn.commit()
     finally:
         conn.close()
-# =====================================================
-# 3. KIỂM TRA QUYỀN ADMIN
-# =====================================================
+
+def set_db_content(text: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM bot_content;")
+            cur.execute("INSERT INTO bot_content (id, content) VALUES (1, %s);", (text,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_db_content():
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT content FROM bot_content WHERE id = 1;")
+            row = cur.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+def delete_db_content():
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM bot_content;")
+        conn.commit()
+    finally:
+        conn.close()
+
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
+
 # =====================================================
-# 4. HÀM GỬI THÔNG BÁO ĐỊNH KỲ
+# 3. VÒNG LẶP GỬI THÔNG BÁO ĐỊNH KỲ (2 PHÚT/LẦN)
 # =====================================================
-async def alarm_broadcast_callback(
-    context: ContextTypes.DEFAULT_TYPE
-):
-    message_text = context.job.data
+async def periodic_broadcast():
+    global broadcast_task
     try:
-        groups = get_bot_groups()
-    except Exception:
-        logger.exception("Không thể lấy danh sách nhóm từ database.")
+        while True:
+            await asyncio.sleep(120)  # Đợi 2 phút
+            message_text = get_db_content()
+            groups = get_bot_groups()
+            
+            if not message_text or not groups:
+                continue
+
+            for group_id in groups:
+                try:
+                    # Gửi tin nhắn bằng chính tài khoản cá nhân của bạn
+                    await client.send_message(group_id, message_text)
+                    logger.info(f"Đã tự động gửi tin nhắn đến nhóm {group_id}")
+                except Exception as e:
+                    logger.error(f"Lỗi gửi tin tới nhóm {group_id}: {e}")
+    except asyncio.CancelledError:
+        logger.info("Tiến trình định kỳ đã bị dừng.")
+
+# =====================================================
+# 4. CÁC LỆNH ĐIỀU KHIỂN (Nhắn qua Saved Messages hoặc chat riêng với tài khoản)
+# =====================================================
+@client.on(events.NewMessage(pattern='/start'))
+async def start(event):
+    if not is_admin(event.sender_id):
         return
-    if not groups:
-        logger.warning("Không có nhóm nhận thông báo.")
-        return
-    success = 0
-    failed = 0
-    for group_id in groups:
-        try:
-            await context.bot.send_message(
-                chat_id=group_id,
-                text=message_text,
-            )
-            success += 1
-            logger.info(
-                "Gửi thông báo định kỳ thành công đến nhóm %s",
-                group_id,
-            )
-        except TelegramError as e:
-            failed += 1
-            logger.error(
-                "Telegram từ chối gửi đến nhóm %s: %s",
-                group_id,
-                e,
-            )
-        except Exception:
-            failed += 1
-            logger.exception(
-                "Lỗi không xác định khi gửi đến nhóm %s",
-                group_id,
-            )
-    logger.info(
-        "Thông báo định kỳ: thành công %s/%s, thất bại %s",
-        success,
-        len(groups),
-        failed,
+    await event.respond(
+        "🤖 **USERBOT QUẢN LÝ THÔNG BÁO ĐANG CHẠY!**\n\n"
+        "• `/addid [id_nhóm]` - Thêm nhóm\n"
+        "• `/lsid` - Xem danh sách nhóm\n"
+        "• `/themnd [nội dung]` - Cài đặt nội dung\n"
+        "• `/nd` - Xem nội dung hiện tại\n"
+        "• `/xoand` - Xóa nội dung\n"
+        "• `/tb` - Bắt đầu tự động gửi (2 phút/lần)\n"
+        "• `/stoptb` - Dừng tự động gửi",
+        parse_mode='md'
     )
-# =====================================================
-# 5. LỆNH /START
-# =====================================================
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.effective_message.reply_text(
-            "Bạn không có quyền sử dụng bot này."
-        )
+
+@client.on(events.NewMessage(pattern='/themnd'))
+async def themnd_command(event):
+    if not is_admin(event.sender_id):
         return
-    await update.effective_message.reply_text(
-        "🤖 BOT THÔNG BÁO ĐANG HOẠT ĐỘNG!\n\n"
-        "Các lệnh sử dụng:\n\n"
-        "/addid ID_NHOM - Thêm nhóm nhận thông báo\n"
-        "/lsid - Xem danh sách nhóm\n"
-        "/tb nội dung - Bắt đầu thông báo mỗi 2 phút\n"
-        "/stoptb - Dừng thông báo\n\n"
-        "⏰ Chu kỳ gửi: 120 giây/lần."
-    )
-# =====================================================
-# 6. LỆNH /ADDID
-# =====================================================
-async def addid_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.effective_message.reply_text(
-            "Bạn không có quyền sử dụng lệnh này."
-        )
-        return
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Cách sử dụng:\n/addid ID_NHOM"
-        )
-        return
-    try:
-        group_id = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text(
-            "❌ ID nhóm phải là số nguyên."
-        )
-        return
-    try:
-        chat = await context.bot.get_chat(group_id)
-        chat_title = chat.title or "Không có tên"
-        chat_username = (
-            f"@{chat.username}"
-            if chat.username
-            else "Không có username"
-        )
-        keyboard = [[
-            InlineKeyboardButton(
-                "✅ Xác nhận thêm nhóm",
-                callback_data=f"confirm_add_{group_id}",
-            )
-        ]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.effective_message.reply_text(
-            f"📋 THÔNG TIN NHÓM\n\n"
-            f"Tên nhóm: {chat_title}\n"
-            f"Username: {chat_username}\n"
-            f"ID nhóm: {group_id}\n\n"
-            f"Bạn có muốn thêm nhóm này vào danh sách nhận thông báo không?",
-            reply_markup=reply_markup,
-        )
-    except TelegramError as e:
-        logger.exception("Không lấy được thông tin nhóm.")
-        await update.effective_message.reply_text(
-            f"❌ Không thể lấy thông tin nhóm.\n\n"
-            f"Kiểm tra ID nhóm và đảm bảo bot có thể truy cập nhóm.\n\n"
-            f"Lỗi: {str(e)[:1000]}"
-        )
-# =====================================================
-# 7. XỬ LÝ NÚT XÁC NHẬN THÊM NHÓM
-# =====================================================
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        await query.edit_message_text(
-            "Bạn không có quyền thao tác."
-        )
-        return
-    data = query.data
-    if not data.startswith("confirm_add_"):
-        return
-    try:
-        group_id = int(data.replace("confirm_add_", "", 1))
-        # Lưu ID nhóm vào database
-        save_group(group_id)
-        # Lấy thông tin nhóm
-        chat = await context.bot.get_chat(group_id)
-        chat_title = chat.title or "Không có tên"
-        chat_username = (
-            f"@{chat.username}"
-            if chat.username
-            else "Không có"
-        )
-        await query.edit_message_text(
-            f"✅ ĐÃ THÊM NHÓM THÀNH CÔNG!\n\n"
-            f"Tên nhóm: {chat_title}\n"
-            f"Username: {chat_username}\n"
-            f"ID nhóm: {group_id}\n\n"
-            f"Nhóm đã được lưu vào PostgreSQL."
-        )
-    except Exception as e:
-        logger.exception("Lỗi xác nhận thêm nhóm.")
-        await query.edit_message_text(
-            f"❌ Lỗi khi thêm nhóm:\n{str(e)[:1000]}"
-        )
-# =====================================================
-# 8. LỆNH /LSID
-# =====================================================
-async def lsid_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.effective_message.reply_text(
-            "Bạn không có quyền sử dụng lệnh này."
-        )
-        return
-    try:
-        groups = sorted(get_bot_groups())
-        if not groups:
-            await update.effective_message.reply_text(
-                "📋 Danh sách nhóm hiện tại đang trống."
-            )
-            return
-        result = (
-            f"📋 DANH SÁCH NHÓM ĐÃ THÊM\n"
-            f"Tổng số: {len(groups)} nhóm\n\n"
-        )
-        for group_id in groups:
-            try:
-                chat = await context.bot.get_chat(group_id)
-                title = chat.title or "Không có tên"
-                username = (
-                    f"@{chat.username}"
-                    if chat.username
-                    else "Không có"
-                )
-                result += (
-                    f"Nhóm: {title}\n"
-                    f"Username: {username}\n"
-                    f"ID: {group_id}\n\n"
-                )
-            except TelegramError as e:
-                result += (
-                    f"ID: {group_id}\n"
-                    f"Không lấy được thông tin: {str(e)[:150]}\n\n"
-                )
-        # Chia tin nhắn nếu danh sách quá dài
-        for i in range(0, len(result), 4000):
-            await update.effective_message.reply_text(
-                result[i:i + 4000]
-            )
-    except Exception as e:
-        logger.exception("Lỗi đọc danh sách nhóm.")
-        await update.effective_message.reply_text(
-            f"❌ Không đọc được database:\n{str(e)[:1000]}"
-        )
-# =====================================================
-# 9. LỆNH /TB - GỬI NGAY VÀ LẶP LẠI MỖI 2 PHÚT
-# =====================================================
-async def broadcast_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.effective_message.reply_text(
-            "Bạn không có quyền sử dụng lệnh này."
-        )
-        return
-    text = " ".join(context.args).strip()
+    text = event.raw_text.replace('/themnd', '').strip()
     if not text:
-        await update.effective_message.reply_text(
-            "⚠️ Cách sử dụng:\n/tb Nội dung thông báo"
-        )
+        await event.respond("⚠️ Vui lòng nhập nội dung. Ví dụ: `/themnd Chào mọi người`", parse_mode='md')
         return
-    if context.job_queue is None:
-        await update.effective_message.reply_text(
-            "❌ JobQueue chưa được cài đặt.\n\n"
-            "Chạy lệnh:\n"
-            "pip install -U 'python-telegram-bot[job-queue]'"
-        )
+    set_db_content(text)
+    await event.respond(f"✅ **Đã lưu nội dung thông báo:**\n{text}", parse_mode='md')
+
+@client.on(events.NewMessage(pattern='/nd'))
+async def nd_command(event):
+    if not is_admin(event.sender_id):
+        return
+    content = get_db_content()
+    if not content:
+        await event.respond("📋 Nội dung hiện tại đang trống.")
+        return
+    await event.respond(f"📋 **Nội dung hiện tại:**\n\n{content}", parse_mode='md')
+
+@client.on(events.NewMessage(pattern='/xoand'))
+async def xoand_command(event):
+    if not is_admin(event.sender_id):
+        return
+    delete_db_content()
+    await event.respond("🗑️ Đã xóa nội dung thông báo thành công!")
+
+@client.on(events.NewMessage(pattern='/addid'))
+async def addid_command(event):
+    if not is_admin(event.sender_id):
+        return
+    parts = event.raw_text.split()
+    if len(parts) < 2:
+        await event.respond("⚠️️ Sử dụng: `/addid [ID_nhóm]`", parse_mode='md')
         return
     try:
-        groups = sorted(get_bot_groups())
+        group_id = int(parts[1])
+        save_group(group_id)
+        chat = await client.get_entity(group_id)
+        title = getattr(chat, 'title', 'Không có tên')
+        await event.respond(f"✅ **Đã thêm nhóm thành công!**\n• Tên: {title}\n• ID: `{group_id}`", parse_mode='md')
     except Exception as e:
-        logger.exception("Không thể đọc danh sách nhóm.")
-        await update.effective_message.reply_text(
-            f"❌ Lỗi database:\n{str(e)[:1000]}"
-        )
+        await event.respond(f"❌ Lỗi thêm nhóm: {e}")
+
+@client.on(events.NewMessage(pattern='/lsid'))
+async def lsid_command(event):
+    if not is_admin(event.sender_id):
+        return
+    groups = get_bot_groups()
+    if not groups:
+        await event.respond("📋 Danh sách nhóm trống.")
+        return
+    text = f"📋 **Danh sách nhóm ({len(groups)}):**\n\n"
+    for gid in groups:
+        try:
+            chat = await client.get_entity(gid)
+            title = getattr(chat, 'title', 'Không có tên')
+            text += f"• {title} (`{gid}`)\n"
+        except Exception:
+            text += f"• (`{gid}`)\n"
+    await event.respond(text, parse_mode='md')
+
+@client.on(events.NewMessage(pattern='/tb'))
+async def tb_command(event):
+    global broadcast_task
+    if not is_admin(event.sender_id):
+        return
+    
+    text = get_db_content()
+    groups = get_bot_groups()
+    if not text:
+        await event.respond("⚠️ Chưa có nội dung thông báo. Hãy dùng `/themnd` trước.")
         return
     if not groups:
-        await update.effective_message.reply_text(
-            "❌ Chưa có nhóm nhận thông báo.\n"
-            "Hãy sử dụng /addid để thêm nhóm."
-        )
+        await event.respond("❌ Chưa có nhóm nào được thêm.")
         return
-    current_jobs = context.job_queue.get_jobs_by_name(JOB_NAME)
-    if current_jobs:
-        await update.effective_message.reply_text(
-            "⚠️ Đang có thông báo chạy.\n"
-            "Hãy dùng /stoptb trước khi thay đổi nội dung."
-        )
+
+    if broadcast_task and not broadcast_task.done():
+        await event.respond("⚠️ Tiến trình tự động gửi đang chạy rồi.")
         return
-    success = []
-    failed = []
-    # GỬI THÔNG BÁO NGAY LẬP TỨC
-    for group_id in groups:
+
+    # Gửi ngay lập tức lần đầu tiên bằng tài khoản của bạn
+    success = 0
+    for gid in groups:
         try:
-            await context.bot.send_message(
-                chat_id=group_id,
-                text=text,
-            )
-            success.append(group_id)
-            logger.info(
-                "Gửi thông báo thành công đến nhóm %s",
-                group_id,
-            )
-        except TelegramError as e:
-            failed.append((group_id, str(e)))
-            logger.error(
-                "Gửi thất bại đến nhóm %s: %s",
-                group_id,
-                e,
-            )
+            await client.send_message(gid, text)
+            success += 1
         except Exception as e:
-            failed.append((group_id, str(e)))
-            logger.exception(
-                "Lỗi gửi thông báo đến nhóm %s",
-                group_id,
-            )
-    # Nếu tất cả nhóm đều thất bại thì không tạo lịch
-    if not success:
-        error_text = "❌ GỬI THẤT BẠI TẤT CẢ NHÓM!\n\n"
-        for group_id, error in failed:
-            error_text += (
-                f"ID nhóm: {group_id}\n"
-                f"Lỗi: {error[:250]}\n\n"
-            )
-        await update.effective_message.reply_text(
-            error_text[:4000]
-        )
+            logger.error(f"Lỗi gửi ngay tới {gid}: {e}")
+
+    # Bắt đầu chạy vòng lặp nền
+    broadcast_task = asyncio.create_task(periodic_broadcast())
+    await event.respond(f"📢 **Đã bắt đầu tự động gửi tin bằng tài khoản của bạn!**\n- Thành công gửi ngay: {success} nhóm\n- Chu kỳ: 2 phút/lần", parse_mode='md')
+
+@client.on(events.NewMessage(pattern='/stoptb'))
+async def stoptb_command(event):
+    global broadcast_task
+    if not is_admin(event.sender_id):
         return
-    # BẮT ĐẦU GỬI ĐỊNH KỲ MỖI 120 GIÂY
-    try:
-        context.job_queue.run_repeating(
-            alarm_broadcast_callback,
-            interval=BROADCAST_INTERVAL,
-            first=BROADCAST_INTERVAL,
-            data=text,
-            name=JOB_NAME,
-        )
-    except Exception as e:
-        logger.exception("Không tạo được lịch thông báo.")
-        await update.effective_message.reply_text(
-            f"⚠️ Đã gửi tin ngay đến {len(success)} nhóm "
-            f"nhưng không tạo được lịch định kỳ.\n\n"
-            f"Lỗi: {str(e)[:1000]}"
-        )
-        return
-    # BÁO KẾT QUẢ
-    result = (
-        f"📢 ĐÃ BẮT ĐẦU THÔNG BÁO!\n\n"
-        f"✅ Gửi thành công: {len(success)}/{len(groups)} nhóm\n"
-        f"❌ Gửi thất bại: {len(failed)} nhóm\n"
-        f"⏰ Chu kỳ: 120 giây/lần\n\n"
-        f"📝 Nội dung:\n{text}\n\n"
-        f"🛑 Dùng /stoptb để dừng."
-    )
-    if failed:
-        result += "\n\n❌ CHI TIẾT NHÓM THẤT BẠI:\n"
-        for group_id, error in failed:
-            result += (
-                f"\nID: {group_id}\n"
-                f"Lỗi: {error[:200]}\n"
-            )
-    await update.effective_message.reply_text(
-        result[:4000]
-    )
+    if broadcast_task and not broadcast_task.done():
+        broadcast_task.cancel()
+        broadcast_task = None
+        await event.respond("🛑 Đã dừng tiến trình tự động gửi thông báo!")
+    else:
+        await event.respond("⚠️ Không có tiến trình nào đang chạy.")
+
 # =====================================================
-# 10. LỆNH /STOPTB
-# =====================================================
-async def stop_broadcast_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    user = update.effective_user
-    if not user or not is_admin(user.id):
-        await update.effective_message.reply_text(
-            "Bạn không có quyền sử dụng lệnh này."
-        )
-        return
-    if context.job_queue is None:
-        await update.effective_message.reply_text(
-            "JobQueue chưa được kích hoạt."
-        )
-        return
-    current_jobs = context.job_queue.get_jobs_by_name(JOB_NAME)
-    if not current_jobs:
-        await update.effective_message.reply_text(
-            "⚠️ Hiện không có thông báo định kỳ nào đang chạy."
-        )
-        return
-    for job in current_jobs:
-        job.schedule_removal()
-    await update.effective_message.reply_text(
-        "🛑 ĐÃ DỪNG THÔNG BÁO ĐỊNH KỲ THÀNH CÔNG!"
-    )
-# =====================================================
-# 11. KHỞI ĐỘNG BOT
+# 5. KHỞI CHẠY
 # =====================================================
 def main():
-    if not BOT_TOKEN:
-        logger.error("Chưa cấu hình BOT_TOKEN trong file .env")
+    if not API_ID or not API_HASH:
+        logger.error("Chưa cấu hình API_ID hoặc API_HASH trong tệp .env")
         return
-    if not ADMIN_ID:
-        logger.error("Chưa cấu hình ADMIN_ID trong file .env")
-        return
-    if not all([DB_NAME, DB_USER, DB_PASSWORD]):
-        logger.error(
-            "Thiếu DB_NAME, DB_USER hoặc DB_PASSWORD trong file .env"
-        )
-        return
-    try:
-        init_db()
-    except Exception:
-        logger.exception("Không thể kết nối hoặc khởi tạo PostgreSQL.")
-        return
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    # ĐĂNG KÝ CÁC LỆNH
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addid", addid_command))
-    app.add_handler(CommandHandler("lsid", lsid_command))
-    app.add_handler(CommandHandler("tb", broadcast_command))
-    app.add_handler(CommandHandler("stoptb", stop_broadcast_command))
-    # XỬ LÝ NÚT XÁC NHẬN
-    app.add_handler(CallbackQueryHandler(button_handler))
-    logger.info("Bot thông báo đang khởi động...")
-    app.run_polling()
-if __name__ == "__main__":
+    init_db()
+    
+    print("UserBot đang khởi động và kết nối Telegram...")
+    # Khi chạy lệnh này lần đầu tiên, Telethon sẽ yêu cầu bạn nhập SĐT và mã OTP trực tiếp tại Terminal VPS
+    client.start()
+    print("UserBot đã đăng nhập thành công bằng tài khoản cá nhân!")
+    
+    client.run_until_disconnected()
+
+if __name__ == '__main__':
     main()
