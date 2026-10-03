@@ -157,13 +157,22 @@ async def alarm_broadcast_callback(context: ContextTypes.DEFAULT_TYPE):
 
 # Lệnh /start hiển thị Menu chính
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user = update.effective_user
+    if user and update.effective_chat.type == "private":
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("INSERT INTO spam_users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;", (user.id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    if not is_admin(user.id):
         await update.message.reply_text("Bạn không có quyền sử dụng bot này.")
         return
 
     keyboard = [
         [InlineKeyboardButton("🚀 Bật Spam tự động (2 phút/lần)", callback_data="run_spam")],
-        [InlineKeyboardButton("⏹️️ Dừng Spam tự động", callback_data="stop_spam")],
+        [InlineKeyboardButton("⏹ Dừng Spam tự động", callback_data="stop_spam")],
         [InlineKeyboardButton("📋 Danh sách ID nhóm hiện tại", callback_data="list_groups")],
         [InlineKeyboardButton("📝 Nội dung spam", callback_data="view_content")],
     ]
@@ -238,7 +247,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text("Bảng điều khiển Spam Bot:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# Hàm ghi nhận nhóm và người dùng tương tác với bot
+# Hàm ghi nhận nhóm và người dùng tương tác tự động
 async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
@@ -247,13 +256,11 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur = conn.cursor()
 
     try:
-        # Nếu là nhóm/siêu nhóm
         if chat and chat.type in ["group", "supergroup"]:
             cur.execute(
                 "INSERT INTO spam_groups (group_id) VALUES (%s) ON CONFLICT (group_id) DO NOTHING;", 
                 (chat.id,)
             )
-        # Nếu là chat riêng tư với user
         if user and chat and chat.type == "private":
             cur.execute(
                 "INSERT INTO spam_users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;", 
@@ -268,7 +275,16 @@ async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Lệnh /tb: Bắt đầu gửi thông báo lặp lại mỗi 2 phút đến tất cả user và nhóm
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user = update.effective_user
+    # Tự động lưu admin vào danh sách user luôn để đảm bảo nhận được tin nhắn
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO spam_users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;", (user.id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    if not is_admin(user.id):
         return
 
     text = " ".join(context.args)
@@ -276,13 +292,11 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Sử dụng: /tb [Nội dung thông báo cần gửi định kỳ]")
         return
 
-    # Kiểm tra xem đã có job thông báo chạy chưa
     current_jobs = context.job_queue.get_jobs_by_name("broadcast_job")
     if current_jobs:
         await update.message.reply_text("⚠️ Đang có một tiến trình thông báo (/tb) chạy rồi. Hãy dùng /stoptb trước nếu muốn thay đổi!")
         return
 
-    # Đặt lịch lặp lại mỗi 120 giây (2 phút), chạy ngay lần đầu (first=0) với dữ liệu thông báo là text
     context.job_queue.run_repeating(
         alarm_broadcast_callback,
         interval=120,
@@ -300,7 +314,7 @@ async def stop_broadcast_command(update: Update, context: ContextTypes.DEFAULT_T
 
     current_jobs = context.job_queue.get_jobs_by_name("broadcast_job")
     if not current_jobs:
-        await update.message.reply_text("⚠️️ Hiện không có tiến trình thông báo (/tb) nào đang chạy.")
+        await update.message.reply_text("⚠ Hiện không có tiến trình thông báo (/tb) nào đang chạy.")
         return
 
     for job in current_jobs:
@@ -320,7 +334,6 @@ async def set_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE spam_settings SET content = %s WHERE id = 1;", (text,))
     conn.commit()
     cur.close()
     conn.close()
@@ -356,8 +369,9 @@ def main():
     app.add_handler(CommandHandler("tb", broadcast_command))
     app.add_handler(CommandHandler("stoptb", stop_broadcast_command))
     
-    # Lắng nghe mọi tin nhắn để tự động lưu ID nhóm hoặc user vào DB
-    app.add_handler(MessageHandler(filters.ALL, track_chats))
+    # Lắng nghe tin nhắn chữ và sự kiện thêm nhóm chuẩn xác
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_chats))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, track_chats))
     
     app.add_handler(CallbackQueryHandler(button_handler))
 
