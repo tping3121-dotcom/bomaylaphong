@@ -49,10 +49,10 @@ def init_db():
             content TEXT
         );
     """)
-    # Tạo bảng lưu danh sách nhóm
+    # Tạo bảng lưu danh sách nhóm (Lưu dưới dạng chat_id kiểu BIGINT để chính xác tuyệt đối)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS spam_groups (
-            group_identifier VARCHAR(255) PRIMARY KEY
+            group_id BIGINT PRIMARY KEY
         );
     """)
     
@@ -81,15 +81,35 @@ def get_spam_content():
     conn.close()
     return row[0] if row else "Chưa có nội dung spam nào được thiết lập."
 
-# Lấy danh sách nhóm từ DB
+# Lấy danh sách ID nhóm từ DB
 def get_spam_groups():
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT group_identifier FROM spam_groups;")
+    cur.execute("SELECT group_id FROM spam_groups;")
     rows = cur.fetchall()
     cur.close()
     conn.close()
     return {row[0] for row in rows}
+
+# Hàm chạy định kỳ gửi tin nhắn spam mỗi 2 phút (120 giây)
+async def alarm_spam_callback(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    spam_groups = get_spam_groups()
+    spam_content = get_spam_content()
+
+    if not spam_groups or spam_content == "Chưa có nội dung spam nào được thiết lập.":
+        logging.warning("Job spam dừng lại vì chưa có nhóm hoặc nội dung spam.")
+        return
+
+    success_count = 0
+    for group_id in spam_groups:
+        try:
+            await context.bot.send_message(chat_id=group_id, text=spam_content)
+            success_count += 1
+        except Exception as e:
+            logging.error(f"Không thể gửi tin nhắn tự động tới nhóm {group_id}: {e}")
+    
+    logging.info(f"Đã chạy vòng lặp spam tự động: Gửi thành công đến {success_count}/{len(spam_groups)} nhóm.")
 
 # Lệnh /start hiển thị Menu chính
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -98,8 +118,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = [
-        [InlineKeyboardButton("🚀 Spam ngay", callback_data="run_spam")],
-        [InlineKeyboardButton("📋 Nhóm spam hiện tại", callback_data="list_groups")],
+        [InlineKeyboardButton("🚀 Bật Spam tự động (2 phút/lần)", callback_data="run_spam")],
+        [InlineKeyboardButton("⏹️ Dừng Spam tự động", callback_data="stop_spam")],
+        [InlineKeyboardButton("📋 Danh sách ID nhóm hiện tại", callback_data="list_groups")],
         [InlineKeyboardButton("📝 Nội dung spam", callback_data="view_content")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -120,27 +141,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "run_spam":
         if not spam_groups:
-            await query.edit_message_text("❌ Chưa có nhóm nào trong danh sách spam.")
+            await query.edit_message_text("❌ Chưa có nhóm nào lưu trong hệ thống. Hãy thêm bot vào các nhóm chat trước.")
             return
         if spam_content == "Chưa có nội dung spam nào được thiết lập.":
-            await query.edit_message_text("❌ Chưa thiết lập nội dung spam.")
+            await query.edit_message_text("❌ Chưa thiết lập nội dung spam. Hãy dùng lệnh /nd để tạo nội dung.")
             return
 
-        success_count = 0
-        for group in spam_groups:
-            try:
-                await context.bot.send_message(chat_id=group, text=spam_content)
-                success_count += 1
-            except Exception as e:
-                logging.error(f"Không thể gửi tin nhắn tới {group}: {e}")
+        # Kiểm tra xem job spam đã chạy chưa để tránh bị lặp nhiều tiến trình trùng lặp
+        current_jobs = context.job_queue.get_jobs_by_name("spam_job")
+        if current_jobs:
+            await query.edit_message_text("⚠️ Tiến trình spam tự động đã đang chạy từ trước rồi!")
+            return
 
-        await query.edit_message_text(f"✅ Đã spam thành công đến {success_count}/{len(spam_groups)} nhóm!")
+        # Đặt lịch chạy định kỳ mỗi 120 giây (2 phút), chạy ngay lập tức lần đầu tiên (first=0)
+        context.job_queue.run_repeating(
+            alarm_spam_callback, 
+            interval=120, 
+            first=0, 
+            name="spam_job"
+        )
+        await query.edit_message_text("✅ Đã kích hoạt chế độ tự động spam vào nhóm mỗi **2 phút/lần**!", parse_mode="Markdown")
+
+    elif data == "stop_spam":
+        current_jobs = context.job_queue.get_jobs_by_name("spam_job")
+        if not current_jobs:
+            await query.edit_message_text("⚠️ Hiện tại không có tiến trình spam nào đang chạy.")
+            return
+        
+        for job in current_jobs:
+            job.schedule_removal()
+        
+        await query.edit_message_text("🛑 Đã dừng thành công tiến trình tự động spam!")
 
     elif data == "list_groups":
         if not spam_groups:
             text = "Danh sách nhóm spam hiện tại: Trống."
         else:
-            text = "📋 **Danh sách nhóm spam hiện tại:**\n" + "\n".join(spam_groups)
+            text = "📋 **Danh sách ID các nhóm bot đang tham gia:**\n" + "\n".join(str(g) for g in spam_groups)
         
         keyboard = [[InlineKeyboardButton("🔙 Quay lại Menu", callback_data="back_home")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -152,55 +189,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "back_home":
         keyboard = [
-            [InlineKeyboardButton("🚀 Spam ngay", callback_data="run_spam")],
-            [InlineKeyboardButton("📋 Nhóm spam hiện tại", callback_data="list_groups")],
+            [InlineKeyboardButton("🚀 Bật Spam tự động (2 phút/lần)", callback_data="run_spam")],
+            [InlineKeyboardButton("⏹️ Dừng Spam tự động", callback_data="stop_spam")],
+            [InlineKeyboardButton("📋 Danh sách ID nhóm hiện tại", callback_data="list_groups")],
             [InlineKeyboardButton("📝 Nội dung spam", callback_data="view_content")],
         ]
-        await query.edit_message_text("Bảng điều khiển Spam Bot:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("Bảng điều khiển Spam Bot:", reply_markup=reply_markup)
 
-# Lệnh /add: Thêm nhóm vào DB
-async def add_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    
-    if not context.args:
-        await update.message.reply_text("Sử dụng: /add @username_nhom hoặc ID nhóm")
-        return
-
-    group = context.args[0]
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO spam_groups (group_identifier) VALUES (%s) ON CONFLICT (group_identifier) DO NOTHING;", (group,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        await update.message.reply_text(f"✅ Đã thêm nhóm {group} vào danh sách spam (lưu vào Database).")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Lỗi khi lưu vào Database: {e}")
-
-# Lệnh /xoaadd: Xoá nhóm khỏi DB
-async def remove_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-
-    if not context.args:
-        await update.message.reply_text("Sử dụng: /xoaadd @username_nhom")
-        return
-
-    group = context.args[0]
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM spam_groups WHERE group_identifier = %s;", (group,))
-    row_count = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    if row_count > 0:
-        await update.message.reply_text(f"🗑️ Đã xoá nhóm {group} khỏi danh sách.")
-    else:
-        await update.message.reply_text(f"⚠️ Không tìm thấy nhóm {group} trong danh sách.")
+# Hàm tự động ghi nhận nhóm khi bot được thêm vào nhóm hoặc có tin nhắn trong nhóm
+async def track_chats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat and chat.type in ["group", "supergroup"]:
+        group_id = chat.id
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO spam_groups (group_id) VALUES (%s) ON CONFLICT (group_id) DO NOTHING;", 
+                (group_id,)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logging.error(f"Lỗi khi tự động lưu nhóm {group_id}: {e}")
 
 # Lệnh /nd: Thêm/Sửa nội dung spam vào DB
 async def set_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,13 +257,16 @@ def main():
 
     # Đăng ký các Handler
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("add", add_group))
-    app.add_handler(CommandHandler("xoaadd", remove_group))
     app.add_handler(CommandHandler("nd", set_content))
     app.add_handler(CommandHandler("xoand", clear_content))
+    
+    # Lắng nghe mọi tin nhắn hoặc sự kiện thêm nhóm để tự động lưu ID nhóm vào DB
+    from telegram.ext import MessageHandler, filters
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, track_chats))
+    
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    print("Bot kết nối PostgreSQL đang chạy...")
+    print("Bot tự động spam đang chạy...")
     app.run_polling()
 
 if __name__ == "__main__":
