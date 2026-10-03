@@ -72,7 +72,8 @@ def get_bot_groups():
 
 # Hàm chạy định kỳ gửi thông báo đến các nhóm mỗi 2 phút (120 giây)
 async def alarm_broadcast_callback(context: ContextTypes.DEFAULT_TYPE):
-    message_text = context.job.data
+    job = context.job
+    message_text = job.data
     groups = get_bot_groups()
 
     if not groups:
@@ -85,7 +86,7 @@ async def alarm_broadcast_callback(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=group_id, text=message_text)
             success_count += 1
         except Exception as e:
-            logging.error(f"Lỗi gửi thông báo đến nhóm {group_id}: {e}")
+            logging.error(f"Lỗi gửi thông báo định kỳ đến nhóm {group_id}: {e}")
 
     logging.info(f"Đã gửi thông báo định kỳ thành công đến {success_count}/{len(groups)} nhóm.")
 
@@ -127,7 +128,6 @@ async def addid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_title = chat.title or "Không có tên"
         chat_username = f"@{chat.username}" if chat.username else "Không có username (@)"
         
-        # Tạo nút xác nhận
         keyboard = [[InlineKeyboardButton("✅ Xác nhận thêm nhóm", callback_data=f"confirm_add_{group_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -165,7 +165,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             conn.commit()
             
-            # Lấy thông tin cập nhật lại giao diện nút
             chat = await context.bot.get_chat(group_id)
             chat_title = chat.title or "Không có tên"
             chat_username = f"@{chat.username}" if chat.username else "Không có"
@@ -229,10 +228,18 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Đang có một tiến trình thông báo chạy rồi. Hãy dùng `/stoptb` trước nếu muốn thay đổi nội dung!")
         return
 
+    # Gửi ngay lập tức một tin nhắn thử nghiệm ra các nhóm để kiểm tra
+    for group_id in groups:
+        try:
+            await context.bot.send_message(chat_id=group_id, text=text)
+        except Exception as e:
+            logging.error(f"Lỗi gửi tin nhắn tức thời tới nhóm {group_id}: {e}")
+
+    # Đặt lịch lặp lại mỗi 120 giây (2 phút)
     context.job_queue.run_repeating(
         alarm_broadcast_callback,
         interval=120,
-        first=0,
+        first=120,
         data=text,
         name="broadcast_job"
     )
