@@ -1,0 +1,11 @@
+# Bỏ qua các tệp cấu hình bảo mật
+.env
+
+# Bỏ qua cache của Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Bỏ qua môi trường ảo (nếu có)
+venv/
+env/
